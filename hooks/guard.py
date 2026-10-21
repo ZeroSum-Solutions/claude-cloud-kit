@@ -213,8 +213,11 @@ _GH_GET = re.compile(r"(?:-X|--method)[\s=]*['\"]?GET\b")
 
 
 def _gh_writes(text: str) -> bool:
-    """gh api sends a write unless the method is GET (fields then become query parameters). Judged per command."""
+    """A gh call writes to a sensitive path unless its method is GET (fields then become query parameters).
+    Judged per command, so one call's GET or fields do not count for another."""
     for part in re.split(r"&&|\|\||[;|\n]", text):
+        if not _GITHUB_WRITE_PATH.search(part):
+            continue
         if _GH_GET.search(part) and not re.search(r"\b(?:POST|PUT|PATCH|DELETE)\b|--input\b", part):
             continue
         if _WRITE.search(part) or _GH_FIELD.search(part):
@@ -254,7 +257,7 @@ _START = (r"(?:^|[;&|\n]|\$\(|(?<![\w$])[({]|\b(?:then|do|else|if|while|until)\s
 _SUPABASE_NAME = r"(supabase)(?![\w/-])"
 _PG_NAME = r"(psql|pg_dump|pg_dumpall|pg_restore|pgcli|usql)(?![\w-])"
 # Piped into a shell, eval'd or fed through xargs: the tool's words can come from anywhere, so match the whole text.
-_SHELL_FED = re.compile(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|ksh)\b|(?:^|[;&|\n({]|\$\()\s*(?:eval|source|xargs)\b"
+_SHELL_FED = re.compile(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|ksh)\b|(?:^|[;&|\n({]|\$\(|\b(?:then|do|else|if|while|until)\s)\s*(?:eval|source|xargs)\b"
                         r"|<\(")
 _SUPABASE_REMOTE = re.compile(r"--linked\b|--db-url\b|--project-ref\b|[$`]"
                               r"|\b(?:dump|pull|push|link|repair|fetch|inspect)\b")

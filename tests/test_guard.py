@@ -564,6 +564,8 @@ ALLOWED = [
     # round 7 (Sol): a filename is not `source`; SQL `service='x'` is not a libpq service
     'pytest tests/supabase -k "$TEST" --cov=src/source.py',
     "psql -h127.0.0.1 -c \"SELECT service='billing' FROM jobs\"",
+    # round 8 (Sol): a read and a comment in one command are judged one call at a time
+    "gh api -X GET repos/o/r/contents/README.md && gh api repos/o/r/issues/5/comments -f body=Reviewed",
 ]
 
 # Allowed on purpose: GitHub refuses these (the Claude GitHub App has no administration write),
@@ -660,6 +662,8 @@ def test_inherited_pghost_with_empty_uri_host(fake_git, monkeypatch):
     monkeypatch.setenv("PGHOST", "db.example.supabase.co")
     assert guard.decide('(psql -c "SELECT 1")', None)
     assert guard.decide("DATABASE_URL='dbname=app' python -c 'import os'", None)
+    # Sol round 8: eval after a shell keyword is shell-fed
+    assert guard.decide("if true; then eval 'psql -c \"SELECT 1\"'; fi", None)
 
 
 def test_non_origin_default_not_inspected(fake_git, monkeypatch):

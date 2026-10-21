@@ -130,7 +130,8 @@ fetch files without hashes and an old `land` can read this file; then remove the
   says how to split it: write the file in one command (or with the Write tool), run the tool in
   another.
 - Keep cloud environments free of database credentials. The database rules know the common
-  hosted-Postgres hosts and loopback; they are not a boundary.
+  hosted-Postgres hosts and loopback; they are not a boundary. A pg_service entry named inside
+  quotes (`psql "service='x'"`) is not checked; cloud VMs carry no pg_service file.
 - Cloud sessions act on GitHub as the signed-in user through the Claude GitHub App, so a
   ruleset bypass for repository admins also lets cloud sessions through. Leave the bypass
   list empty on repos where cloud sessions must not reach `main`.
