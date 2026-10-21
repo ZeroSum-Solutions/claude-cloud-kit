@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""cloud-prep — get a cloud session's repository ready to work in.
+
+Run by the SessionStart hook (`cloud-prep --hook`) and by hand (`cloud-prep --wait`).
+
+1. Picks the Node major the repo pins (.nvmrc, .node-version, mise.toml, .mise.toml,
+   .tool-versions, package.json volta/engines; default 24) and installs it into
+   /opt/node<major> from nodejs.org when missing: SHA-256 checked, built next to /opt and
+   renamed into place under a lock. The primary repo's Node goes first on PATH for the
+   session through CLAUDE_ENV_FILE. If the pinned Node can't be installed in time, the Node
+   already on PATH is used for everything that follows.
+2. Installs dependencies from the lockfiles in the background: one JS manager (pnpm, npm,
+   yarn or bun) and one Python manager (uv or poetry), one install per repo at a time. A
+   hash stamp in the state dir skips an install when nothing changed. `cloud-prep --wait`
+   blocks until it finishes and prints the result.
+3. In hook mode, prints a short context block for Claude: Node, deps, landing policy.
+
+Never fails the session: every problem becomes a line in the context block. Foreground
+work, the Node download included, stops after FOREGROUND_BUDGET seconds.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: mise pins are skipped
+    tomllib = None
+
+DEFAULT_NODE = int(os.environ.get("CLOUD_NODE_DEFAULT", "24"))
+NEWEST_NODE = int(os.environ.get("CLOUD_NODE_NEWEST", "26"))  # newest released major to pick
+FOREGROUND_BUDGET = float(os.environ.get("CLOUD_PREP_BUDGET", "180"))
+INSTALL_TIMEOUT = 1800
+COREPACK_VERSION = "0.36.0"
+NODE_MARKER = ".cloud-prep-complete"
+STATE = Path(os.environ.get("CLOUD_PREP_STATE", "/tmp/cloud-prep"))
+KIT_DIR = Path(os.environ.get("CLOUD_KIT_DIR", Path(__file__).resolve().parent.parent))
+OPT = Path(os.environ.get("CLOUD_NODE_ROOT", "/opt"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from kitpolicy import policy_for  # noqa: E402
+
+LTS_CODENAMES = {
+    "argon": 4, "boron": 6, "carbon": 8, "dubnium": 10, "erbium": 12, "fermium": 14,
+    "gallium": 16, "hydrogen": 18, "iron": 20, "jod": 22, "krypton": 24,
+}
+JS_MANAGERS = {"pnpm", "npm", "yarn", "bun"}
+
+
+# ---------------------------------------------------------------- node version
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _first_line(text: str) -> str | None:
+    """First line that is not blank or a `#` comment, without a trailing comment."""
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            return line
+    return None
+
+
+def _mise_node(text: str) -> str | None:
+    """Node pin from a mise config's [tools] table: "26", { version = "26" } or a list."""
+    if tomllib is None:
+        return None
+    try:
+        tools = tomllib.loads(text).get("tools")
+    except tomllib.TOMLDecodeError:
+        return None
+    if not isinstance(tools, dict):
+        return None
+    for key in ("node", "nodejs", "core:node"):
+        value = tools.get(key)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, dict):
+            value = value.get("version")
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _tool_versions_node(text: str) -> str | None:
+    for line in text.splitlines():
+        parts = line.split("#", 1)[0].split()
+        if len(parts) >= 2 and parts[0] in {"node", "nodejs"}:
+            return parts[1]
+    return None
+
+
+def node_spec(repo: Path) -> tuple[str | None, str | None]:
+    """Return (spec, source file) for the first Node pin found.
+
+    Order: .nvmrc, .node-version, mise.toml, .mise.toml, .tool-versions, package.json.
+    A file that exists but pins no Node does not hide the files after it.
+    """
+    sources = (
+        (".nvmrc", _first_line), (".node-version", _first_line),
+        ("mise.toml", _mise_node), (".mise.toml", _mise_node), (".tool-versions", _tool_versions_node),
+    )
+    for name, parse in sources:
+        text = _read(repo / name)
+        spec = parse(text) if text else None
+        if spec:
+            return spec, name
+    text = _read(repo / "package.json")
+    if text:
+        try:
+            pkg = json.loads(text)
+        except ValueError:
+            pkg = {}
+        if not isinstance(pkg, dict):
+            pkg = {}
+        volta = (pkg.get("volta") or {}).get("node") if isinstance(pkg.get("volta"), dict) else None
+        if volta:
+            return str(volta), "package.json volta"
+        engines = (pkg.get("engines") or {}).get("node") if isinstance(pkg.get("engines"), dict) else None
+        if engines:
+            return str(engines), "package.json engines"
+    return None, None
+
+
+Version = tuple[int, int, int]
+_INF: Version = (10**9, 0, 0)
+_COMPARATOR = re.compile(
+    r"(?:^|(?<=[\s,]))(>=|<=|>|<|=|\^|~>?)?\s*v?(\d+|[x*])(?:\.(\d+|[x*]))?(?:\.(\d+|[x*]))?(?:[-+][0-9a-z.+-]*)?"
+)
+
+
+def _parts(groups: tuple[str | None, ...]) -> list[int]:
+    """Numeric parts before the first wildcard: ("22", "x", None) -> [22]."""
+    out = []
+    for g in groups:
+        if g is None or g in ("x", "*"):
+            break
+        out.append(int(g))
+    return out
+
+
+def _pad(parts: list[int]) -> Version:
+    return tuple((parts + [0, 0, 0])[:3])  # type: ignore[return-value]
+
+
+def _bump(parts: list[int]) -> list[int]:
+    """Smallest version above every version that matches the partial one."""
+    return [*parts[:-1], parts[-1] + 1]
+
+
+def _bounds(op: str, parts: list[int]) -> tuple[Version, Version]:
+    """Half-open interval [lo, hi) of versions one comparator allows."""
+    if not parts:
+        return (0, 0, 0), _INF
+    if op in ("", "="):
+        return _pad(parts), _pad(_bump(parts))
+    if op == "^":
+        return _pad(parts), (parts[0] + 1, 0, 0)
+    if op in ("~", "~>"):
+        return _pad(parts), _pad(_bump(parts[:2]))
+    if op == ">=":
+        return _pad(parts), _INF
+    if op == ">":
+        return _pad(_bump(parts)), _INF
+    if op == "<":
+        return (0, 0, 0), _pad(parts)
+    return (0, 0, 0), _pad(_bump(parts))  # <=
+
+
+def _clause_range(clause: str) -> tuple[Version, Version] | None:
+    """[lo, hi) one `||` clause allows, or None when it does not restrict the version."""
+    clause = clause.strip().lower()
+    if clause.startswith("lts/"):
+        major = LTS_CODENAMES.get(clause[4:])
+        return ((major, 0, 0), (major + 1, 0, 0)) if major else None
+    hyphen = re.fullmatch(r"(\S+)\s+-\s+(\S+)", clause)
+    if hyphen:
+        left = _COMPARATOR.fullmatch(hyphen.group(1))
+        right = _COMPARATOR.fullmatch(hyphen.group(2))
+        if left and right and not left.group(1) and not right.group(1):
+            return _pad(_parts(left.groups()[1:])), _bounds("<=", _parts(right.groups()[1:]))[1]
+    lo, hi, restricted = (0, 0, 0), _INF, False
+    for m in _COMPARATOR.finditer(clause):
+        parts = _parts(m.groups()[1:])
+        if not parts:
+            continue
+        l, h = _bounds(m.group(1) or "", parts)
+        lo, hi, restricted = max(lo, l), min(hi, h), True
+    return (lo, hi) if restricted else None
+
+
+def _major_in(rng: tuple[Version, Version] | None, major: int) -> bool:
+    if rng is None:
+        return True
+    lo, hi = max(rng[0], (major, 0, 0)), min(rng[1], (major + 1, 0, 0))
+    return lo < hi
+
+
+def pick_major(spec: str | None, default: int = DEFAULT_NODE, installed: tuple[int, ...] = ()) -> int:
+    """Major Node version for a pin. Prefers the default, then the newest even (LTS) major that
+    fits, then the newest odd one; falls back to the first number in the pin."""
+    if not spec:
+        return default
+    ranges = [_clause_range(c) for c in spec.strip().lower().split("||")]
+    if any(_major_in(r, default) for r in ranges):
+        return default
+    candidates = sorted(set(installed) | set(range(18, NEWEST_NODE + 1)),
+                        key=lambda m: (m % 2 == 0, m), reverse=True)
+    for major in candidates:
+        if any(_major_in(r, major) for r in ranges):
+            return major
+    m = re.search(r"\d+", spec)
+    return int(m.group()) if m else default
+
+
+def installed_majors() -> tuple[int, ...]:
+    found = []
+    for p in OPT.glob("node[0-9]*"):
+        m = re.fullmatch(r"node(\d+)", p.name)
+        if m and (p / "bin" / "node").exists():
+            found.append(int(m.group(1)))
+    return tuple(sorted(found))
+
+
+# ---------------------------------------------------------------- node install
+
+def _left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("ran out of the time budget")
+    return left
+
+
+@contextlib.contextmanager
+def _locked(path: Path, deadline: float):
+    """Exclusive flock on `path`, waiting until `deadline`."""
+    with open(path, "a") as fh:
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for {path.name}") from None
+                time.sleep(0.5)
+        yield
+
+
+def _node_version(node: Path | str) -> str | None:
+    try:
+        out = subprocess.run([str(node), "-v"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if re.match(r"v\d+\.", out) else None
+
+
+def _node_major(node: Path | str) -> int | None:
+    version = _node_version(node)
+    return int(version[1:].split(".")[0]) if version else None
+
+
+def node_ready(target: Path, major: int) -> bool:
+    """A finished install: ours carry a marker; one that came with the image must run and have npm."""
+    if not (target / "bin" / "node").exists():
+        return False
+    if (target / NODE_MARKER).exists():
+        return True
+    return (target / "bin" / "npm").exists() and _node_major(target / "bin" / "node") == major
+
+
+def _arch() -> str:
+    return {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower(), "x64")
+
+
+def _fetch(url: str, deadline: float) -> bytes:
+    with urllib.request.urlopen(url, timeout=min(20, _left(deadline))) as r:
+        return r.read()
+
+
+def _download(url: str, dest: Path, deadline: float) -> str:
+    """Stream `url` to `dest` within the budget; returns the SHA-256 of what was written."""
+    h = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=min(30, _left(deadline))) as r, open(dest, "wb") as f:
+        while chunk := r.read(1 << 20):
+            _left(deadline)
+            h.update(chunk)
+            f.write(chunk)
+    return h.hexdigest()
+
+
+def _remove(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def install_node(major: int, deadline: float) -> Path:
+    """Install the latest <major>.x into /opt/node<major>, checking the published SHA-256.
+
+    Built in a temp dir on the same filesystem, then renamed into place under a lock, so a
+    concurrent or interrupted install never leaves a half-copied /opt/node<major>.
+    """
+    target = OPT / f"node{major}"
+    if node_ready(target, major):
+        return target
+    with _locked(OPT / f".node{major}.lock", deadline):
+        if node_ready(target, major):
+            return target
+        base = f"https://nodejs.org/dist/latest-v{major}.x/"
+        sums = _fetch(base + "SHASUMS256.txt", deadline).decode()
+        arch = _arch()
+        m = re.search(rf"^([0-9a-f]{{64}})\s+(node-v[\d.]+-linux-{arch}\.tar\.xz)$", sums, re.M)
+        if not m:
+            raise RuntimeError(f"no linux-{arch} build listed for Node {major}")
+        digest, name = m.groups()
+        tmp = Path(tempfile.mkdtemp(prefix=f".node{major}-tmp-", dir=OPT))
+        try:
+            archive = tmp / name
+            if _download(base + name, archive, deadline) != digest:
+                raise RuntimeError(f"checksum mismatch for {name}")
+            with tarfile.open(archive) as tar:
+                tar.extractall(tmp, filter="data")
+            built = tmp / name.removesuffix(".tar.xz")
+            (built / NODE_MARKER).write_text(name + "\n")
+            _remove(target)  # left half-installed by an older kit; we hold the lock
+            os.rename(built, target)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return target
+
+
+def ensure_corepack(node_dir: Path, deadline: float) -> list[str]:
+    """pnpm/yarn shims come from corepack, which Node 25+ no longer ships. Returns problems."""
+    bin_dir = node_dir / "bin"
+    if (bin_dir / "pnpm").exists() and (bin_dir / "yarn").exists():
+        return []
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", COREPACK_ENABLE_DOWNLOAD_PROMPT="0")
+    steps = []
+    if not (bin_dir / "corepack").exists():
+        steps.append([str(bin_dir / "npm"), "install", "-g", "--silent", "--ignore-scripts",
+                      f"corepack@{COREPACK_VERSION}"])
+    steps.append([str(bin_dir / "corepack"), "enable"])
+    with _locked(node_dir.parent / f".{node_dir.name}.corepack.lock", deadline):
+        for cmd in steps:
+            label = " ".join([Path(cmd[0]).name, *cmd[1:2]])
+            try:
+                r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=min(180, _left(deadline)))
+            except (OSError, subprocess.SubprocessError, TimeoutError) as e:
+                return [f"{label}: {e}"]
+            if r.returncode != 0:
+                tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+                return [f"{label}: exit {r.returncode} {tail[0]}".strip()]
+    return []
+
+
+# ---------------------------------------------------------------- dependencies
+
+Plan = tuple[str, list[str], list[str], str | None]
+
+
+def _yarn_berry(repo: Path) -> bool:
+    if (repo / ".yarnrc.yml").exists():
+        return True
+    try:
+        pm = json.loads(_read(repo / "package.json") or "{}").get("packageManager", "")
+    except (ValueError, AttributeError):
+        return False
+    m = re.match(r"yarn@(\d+)", str(pm))
+    return bool(m and int(m.group(1)) >= 2)
+
+
+def _js_plan(repo: Path) -> Plan | None:
+    pkg_inputs = ["package.json", ".npmrc", "pnpm-workspace.yaml"]
+    if (repo / "pnpm-lock.yaml").exists():
+        return "pnpm", ["pnpm", "install", "--frozen-lockfile"], ["pnpm-lock.yaml", *pkg_inputs], "node_modules"
+    if (repo / "package-lock.json").exists():
+        return "npm", ["npm", "ci", "--no-audit", "--no-fund"], ["package-lock.json", *pkg_inputs], "node_modules"
+    if (repo / "yarn.lock").exists():
+        frozen = "--immutable" if _yarn_berry(repo) else "--frozen-lockfile"
+        return "yarn", ["yarn", "install", frozen], ["yarn.lock", ".yarnrc.yml", *pkg_inputs], "node_modules"
+    if (repo / "bun.lock").exists() or (repo / "bun.lockb").exists():
+        lock = "bun.lock" if (repo / "bun.lock").exists() else "bun.lockb"
+        return "bun", ["bun", "install", "--frozen-lockfile"], [lock, *pkg_inputs], "node_modules"
+    return None
+
+
+def _py_plan(repo: Path) -> Plan | None:
+    if (repo / "uv.lock").exists():
+        return "uv", ["uv", "sync", "--frozen"], ["uv.lock", "pyproject.toml"], ".venv"
+    if (repo / "poetry.lock").exists():
+        # Poetry may keep its venv outside the repo, so there is no install dir to check.
+        return "poetry", ["poetry", "install", "--no-interaction"], ["poetry.lock", "pyproject.toml"], None
+    return None
+
+
+def install_plans(repo: Path) -> list[Plan]:
+    """(manager, command, files that decide the install, install dir) for the repo root:
+    at most one JS manager (they share node_modules) and one Python manager."""
+    return [p for p in (_js_plan(repo), _py_plan(repo)) if p]
+
+
+def stamp_for(repo: Path, inputs: list[str], node_major: int | None) -> str:
+    h = hashlib.sha256(f"node{node_major or 'none'}\n".encode())
+    for name in inputs:
+        p = repo / name
+        if p.exists():
+            h.update(name.encode() + b"\0" + p.read_bytes())
+    return h.hexdigest()
+
+
+def state_dir(repo: Path) -> Path:
+    d = STATE / hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _install_env(node_bin: Path | None) -> dict[str, str]:
+    env = dict(os.environ)
+    if node_bin:
+        env["PATH"] = f"{node_bin}:{env.get('PATH', '')}"
+    env.setdefault("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+    env.setdefault("CI", "true")
+    if Path("/opt/pw-browsers").is_dir():
+        env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
+    return env
+
+
+def _run_plan(repo: Path, plan: Plan, node_major: int | None, env: dict[str, str], sd: Path, log) -> str:
+    """Run one plan unless its stamp is current. Returns its status part."""
+    manager, cmd, inputs, out_dir = plan
+    stamp = stamp_for(repo, inputs, node_major if manager in JS_MANAGERS else None)
+    stamp_file = sd / f"{manager}.sha256"
+    if (_read(stamp_file) or "").strip() == stamp and (out_dir is None or (repo / out_dir).is_dir()):
+        return f"ok {manager} (unchanged)"
+    exe = shutil.which(cmd[0], path=env.get("PATH"))
+    if not exe:
+        return f"failed {' '.join(cmd)} ({cmd[0]} not found on PATH) — log: {sd / 'log'}"
+    (sd / "status").write_text(f"running {' '.join(cmd)}\n")
+    log.write(f"$ {' '.join(cmd)}\n")
+    log.flush()
+    start = time.monotonic()
+    try:
+        rc = subprocess.run([exe, *cmd[1:]], cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT,
+                            timeout=INSTALL_TIMEOUT).returncode
+        detail = f"exit {rc}"
+    except (OSError, subprocess.SubprocessError) as e:
+        log.write(f"cloud-prep: {e}\n")
+        rc, detail = None, str(e)
+    secs = int(time.monotonic() - start)
+    if rc != 0:
+        return f"failed {' '.join(cmd)} ({detail}, {secs}s) — log: {sd / 'log'}"
+    try:
+        stamp_file.write_text(stamp + "\n")
+    except OSError as e:
+        log.write(f"cloud-prep warning: could not save the install stamp ({e}); the next session reinstalls\n")
+        return f"ok {manager} ({secs}s; stamp not saved)"
+    return f"ok {manager} ({secs}s)"
+
+
+def run_install(repo: Path, node_major: int | None, node_bin: Path | None) -> int:
+    """Background child: corepack, then every install plan, under the repo's lock.
+    Always leaves a final status, failures first."""
+    sd = state_dir(repo)
+    with open(sd / "lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # a second launcher waits here, then finds the stamps current
+        parts = []
+        with open(sd / "log", "w") as log:
+            try:
+                plans = install_plans(repo)
+                env = _install_env(node_bin)
+                if node_bin and any(p[0] in ("pnpm", "yarn") for p in plans):
+                    try:
+                        problems = ensure_corepack(node_bin.parent, time.monotonic() + 600)
+                    except Exception as e:  # noqa: BLE001 — the install below reports a missing shim
+                        problems = [str(e)]
+                    for problem in problems:
+                        log.write(f"cloud-prep: corepack: {problem}\n")
+                parts = [_run_plan(repo, plan, node_major, env, sd, log) for plan in plans] or ["none"]
+            except Exception as e:  # noqa: BLE001 — the status must never stay "running"
+                log.write(f"cloud-prep error: {e}\n")
+                parts.append(f"failed (cloud-prep error: {e}) — log: {sd / 'log'}")
+        parts.sort(key=lambda p: not p.startswith("failed"))
+        (sd / "status").write_text("; ".join(parts) + "\n")
+    return 1 if parts[0].startswith("failed") else 0
+
+
+def _install_running(sd: Path) -> bool:
+    try:
+        with open(sd / "lock", "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def start_background_install(repo: Path, node_major: int | None, node_bin: Path | None) -> str:
+    plans = install_plans(repo)
+    if not plans:
+        return "no lockfile at the repo root; nothing to install"
+    sd = state_dir(repo)
+    cmds = ", ".join(" ".join(p[1]) for p in plans)
+    if _install_running(sd):
+        return f"an install is already running ({cmds}); `cloud-prep --wait` reports it"
+    (sd / "status").write_text(f"running {cmds}\n")
+    argv = [sys.executable, str(Path(__file__).resolve()), "--install", str(repo)]
+    if node_major:
+        argv += ["--node", str(node_major)]
+    if node_bin:
+        argv += ["--node-bin", str(node_bin)]
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return f"installing in the background ({cmds})"
+
+
+def wait_status(repo: Path, timeout: float) -> str:
+    sd = state_dir(repo)
+    deadline = time.monotonic() + timeout
+    while True:
+        status = _read(sd / "status") or "none\n"
+        if not status.startswith("running"):
+            return status.strip()
+        try:
+            stale = time.time() - (sd / "status").stat().st_mtime > 15
+        except OSError:
+            stale = False
+        if stale and not _install_running(sd):
+            return f"failed (the install stopped without a result) — log: {sd / 'log'}"
+        if time.monotonic() >= deadline:
+            return status.strip()
+        time.sleep(2)
+
+
+# ---------------------------------------------------------------- policy + context
+
+def repo_name(repo: Path) -> str | None:
+    try:
+        url = subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo,
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(?:github\.com[:/]+|/git/)([^/\s]+/[^/\s]+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else None
+
+
+def land_policy(name: str | None) -> str:
+    if not name:
+        return "no GitHub origin; `land` does not apply"
+    may_merge, why = policy_for(name, KIT_DIR)
+    if may_merge:
+        return f"{name}: `land` merges after green CI"
+    return f"{name}: `land` opens the PR and stops for review ({why})"
+
+
+def repo_root(path: Path) -> Path | None:
+    for p in (path, *path.parents):
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def repos_in(cwd: Path) -> list[Path]:
+    root = repo_root(cwd)
+    if root:
+        return [root]
+    return sorted(p.parent for p in cwd.glob("*/.git"))
+
+
+def resolve_node(major: int, deadline: float) -> tuple[int | None, Path | None, str | None]:
+    """(major, bin dir, problem) of the Node to use: the pinned one, else the one on PATH."""
+    try:
+        return major, install_node(major, deadline) / "bin", None
+    except Exception as e:  # noqa: BLE001 — a missing Node must not stop the session
+        node = shutil.which("node")
+        actual = _node_major(node) if node else None
+        return actual, (Path(node).parent if actual else None), f"Node {major} not available ({e})"
+
+
+def write_env(node_bin: Path | None) -> None:
+    if not os.environ.get("CLAUDE_ENV_FILE"):
+        return
+    with open(os.environ["CLAUDE_ENV_FILE"], "a") as env_file:
+        if node_bin:
+            env_file.write(f'export PATH="{node_bin}:$PATH"\n')
+        env_file.write("export COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n")
+        if Path("/opt/pw-browsers").is_dir() and not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+            env_file.write("export PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers\n")
+
+
+def prep(repo: Path, write_session_env: bool, primary: bool, deadline: float) -> list[str]:
+    """Node and dependencies for one repo. Only the primary repo sets the session's PATH."""
+    lines = []
+    spec, source = node_spec(repo)
+    wanted = pick_major(spec, installed=installed_majors())
+    major, node_bin, problem = resolve_node(wanted, deadline)
+    if problem:
+        using = f"using Node {major} from {node_bin}" if node_bin else "no Node on PATH"
+        lines.append(f"{problem}; {using}")
+    else:
+        pin = f" (from {source}: {spec})" if source else " (no pin; default)"
+        where = "" if primary else f"; for this repo use {node_bin} (not on the session PATH)"
+        lines.append(f"Node {_node_version(node_bin / 'node') or major}{pin}{where}")
+    if write_session_env and primary:
+        write_env(None if problem else node_bin)
+    lines.append("Dependencies: " + start_background_install(repo, major, node_bin))
+    lines.append("Landing: " + land_policy(repo_name(repo)))
+    return lines
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="cloud-prep")
+    ap.add_argument("--hook", action="store_true", help="SessionStart mode: prep, then print context")
+    ap.add_argument("--wait", action="store_true", help="block until the dependency install finishes")
+    ap.add_argument("--timeout", type=float, default=900)
+    ap.add_argument("--install", metavar="REPO", help=argparse.SUPPRESS)
+    ap.add_argument("--node", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--node-bin", help=argparse.SUPPRESS)
+    ap.add_argument("--install-node", type=int, metavar="MAJOR", help="install Node MAJOR into /opt (setup.sh)")
+    args = ap.parse_args(argv)
+
+    if args.install:
+        node_bin = Path(args.node_bin) if args.node_bin else None
+        if node_bin is None and args.node and (OPT / f"node{args.node}" / "bin").is_dir():
+            node_bin = OPT / f"node{args.node}" / "bin"
+        return run_install(Path(args.install), args.node, node_bin)
+    if args.install_node:
+        deadline = time.monotonic() + 900
+        node_dir = install_node(args.install_node, deadline)
+        for problem in ensure_corepack(node_dir, deadline):
+            print(f"corepack: {problem}", file=sys.stderr)
+        print(f"node{args.install_node}: {node_dir}")
+        return 0
+
+    if os.environ.get("CLAUDE_CODE_REMOTE") != "true" and not os.environ.get("CLOUD_PREP_FORCE"):
+        if args.hook:
+            return 0
+        print("cloud-prep runs only in Claude Code cloud sessions (set CLOUD_PREP_FORCE=1 to override)")
+        return 0
+
+    cwd = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    repos = repos_in(cwd)
+
+    if args.wait:
+        worst = 0
+        for repo in repos:
+            status = wait_status(repo, args.timeout)
+            print(f"{repo.name}: {status}")
+            if status.startswith(("failed", "running")):
+                worst = 1
+        return worst
+
+    if args.hook:
+        try:
+            event = json.load(sys.stdin)
+        except ValueError:
+            event = {}
+        if event.get("source") == "compact":
+            return 0  # context survives compaction; nothing new to say
+    deadline = time.monotonic() + FOREGROUND_BUDGET
+    out = []
+    targets = repos or [cwd]
+    for i, repo in enumerate(targets):
+        prefix = f"[{repo.name}] " if len(targets) > 1 else ""
+        try:
+            lines = prep(repo, write_session_env=args.hook, primary=i == 0, deadline=deadline)
+        except Exception as e:  # noqa: BLE001 — one repo must not hide the others
+            lines = [f"cloud-prep could not prepare this repo ({e})"]
+        out += [prefix + line for line in lines]
+    out.append("Run `cloud-prep --wait` before tests or builds; it prints the install result.")
+    text = "Cloud kit:\n- " + "\n- ".join(out)
+    if args.hook:
+        json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}, sys.stdout)
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:  # noqa: BLE001 — never block a session start
+        print(f"cloud-prep error: {e}", file=sys.stderr)
+        sys.exit(0)

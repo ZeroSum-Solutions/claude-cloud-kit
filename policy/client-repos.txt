@@ -1,0 +1,16 @@
+# Human-review repositories: `land` pushes and opens the PR, then stops for human review.
+# Repos outside the owner allowlist (wiggdevin, ZeroSum-Solutions) always stop at the PR.
+# One entry per line, case-insensitive: a shell glob, a plain owner/repo for non-client
+# repos, or sha256:<hex> of the lowercased owner/repo so this public file does not name
+# clients. Add a client with:
+#   printf %s 'owner/repo' | tr '[:upper:]' '[:lower:]' | shasum -a 256
+# This kit runs as root on every cloud VM, so its own changes always get a human review.
+zerosum-solutions/claude-cloud-kit
+wiggdevin/client-*
+sha256:99e35ef44f67f40261614b7aecdc5dbb52f6f96089551cde54e3db5de8950064
+sha256:a1967d46de58a7ce909f4d8a958a2d6eccd6ed4bc30c3a2c7324b1d8ab649ca6
+sha256:f09d934f9ab85702955b6c07cb955a14093d9eacb711a5dd6db68ab69c86190c
+sha256:ab5fcf5b3965b540711aea78e7700482344b45c82d27b63a042c8d4eba0c3d3b
+sha256:376b1024cfaf0e9dc2ad91df66e5603211b40838f2c7248740e615f0e7db7ebe
+sha256:330548176599674db3bb616524f1d949938a0ceec4efe29c87749656bdd0ebec
+sha256:473d519a6e8a86a460a0d854aade99aad53227570fd4f269a0ce637e5ebf0685
