@@ -20,11 +20,11 @@ deletion. This script keeps zs-land's safety rules with `gh api` REST calls only
   least one real pass. Pending waits; failure, cancelled, neutral, timed out or action
   required blocks. No passing check after LAND_NO_CI_GRACE seconds fails closed. A pass is
   trusted only LAND_PR_SETTLE seconds after this run's push and PR read, so workflows can
-  register. Re-runs replace an attempt only when they started after it completed; runs
-  with one name that overlapped (matrix legs) are all judged.
+  register. The check runs are GitHub's own latest view (the check-runs API's default
+  `filter=latest`, which keeps the newest run per check name, so a re-run replaces its
+  earlier attempt), the same view `gh pr checks` and zs-land judge.
   Then GitHub's own roll-up must agree, always: mergeable true and mergeable_state "clean"
-  or "has_hooks". It also covers commit statuses the cloud GitHub app cannot read and
-  matrix legs that share a name. "unstable" or "blocked" waits LAND_BLOCKED_WAIT seconds,
+  or "has_hooks". It also covers commit statuses the cloud GitHub app cannot read. "unstable" or "blocked" waits LAND_BLOCKED_WAIT seconds,
   then stops (a non-required or advisory check, or an unreadable status, is not green).
   Advisory checks (LAND_ADVISORY_CHECKS or `git config zs-land.advisoryChecks`, comma
   separated) are left out of the check-run judgement: they cannot fail it and cannot count as
@@ -54,7 +54,6 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -246,33 +245,6 @@ def judge(check_runs: list[dict], statuses: list[dict], advisory: set[str]) -> V
     return Verdict(state, passed, pending, failed, skipped, adv, adv_open)
 
 
-def _when(stamp) -> datetime | None:
-    try:
-        return datetime.fromisoformat(stamp.replace("Z", "+00:00")) if isinstance(stamp, str) else None
-    except ValueError:
-        return None
-
-
-def latest_runs(check_runs: list[dict]) -> list[dict]:
-    """Drop a check run only when a re-run replaced it: a newer run with the same check suite,
-    app and name that started after it completed. Runs that overlapped (matrix legs that share
-    a name) or that lack times all stay, so a failed or neutral leg is never hidden behind a
-    pass. `filter=latest` would also merge same-named jobs from different workflows."""
-    groups: dict[tuple, list[dict]] = {}
-    for run in check_runs:
-        key = ((run.get("check_suite") or {}).get("id"), (run.get("app") or {}).get("id"), run.get("name"))
-        groups.setdefault(key, []).append(run)
-
-    def replaced(old: dict, group: list[dict]) -> bool:
-        done = _when(old.get("completed_at"))
-        return done is not None and any(
-            (new.get("id") or 0) > (old.get("id") or 0)
-            and (started := _when(new.get("started_at"))) is not None and started >= done
-            for new in group)
-
-    return [run for group in groups.values() for run in group if not replaced(run, group)]
-
-
 def strip_proxy_footer(body: str | None) -> str:
     return _PROXY_FOOTER.sub("\n", body or "").rstrip("\n") + "\n"
 
@@ -383,7 +355,8 @@ def read_checks(repo: Repo, sha: str, advisory: set[str], url: str) -> Verdict:
     """The check runs, plus commit statuses when this token can read them. The cloud GitHub
     app has no commit-status permission; then GitHub's roll-up (pr_gate) covers statuses."""
     try:
-        runs = latest_runs(gh_list(f"repos/{repo.nwo}/commits/{sha}/check-runs?filter=all", "check_runs"))
+        # Default filter=latest: GitHub's newest run per check name, as on the PR page.
+        runs = gh_list(f"repos/{repo.nwo}/commits/{sha}/check-runs", "check_runs")
         try:
             statuses = gh_list(f"repos/{repo.nwo}/commits/{sha}/status", "statuses")
         except GhError as e:
@@ -435,8 +408,8 @@ def pr_gate(repo: Repo, live: dict, number: int, sha: str, url: str) -> str:
 
 def ci_state(repo: Repo, number: int, sha: str, url: str, advisory: set[str]) -> tuple[Verdict, str]:
     """One reading of CI: (verdict, rollup). Once every gating check run passes, GitHub's
-    roll-up must agree, always: it also sees statuses this token cannot read, a matrix leg
-    that latest_runs folds into a same-named pass, and non-required checks. rollup is "ok",
+    roll-up must agree, always: it also sees statuses this token cannot read and
+    non-required checks. rollup is "ok",
     the mergeable_state to wait on, or "" while the runs have not passed."""
     verdict = read_checks(repo, sha, advisory, url)
     if verdict.state != "pass":

@@ -557,41 +557,71 @@ def _run_plan(repo: Path, plan: Plan, node_major: int | None, env: dict[str, str
     return f"ok {manager} ({secs}s)"
 
 
-def _write_request(repo: Path, sd: Path, node_major: int | None, node_bin: Path | None) -> None:
-    """The inputs the latest prep asked for, and the repo's Node pin then; a running install
-    re-reads them when it finishes. Each writer has its own temp file."""
-    request = {"node": node_major, "node_bin": str(node_bin) if node_bin else None, "pin": node_spec(repo)[0]}
-    fd, tmp = tempfile.mkstemp(dir=sd, prefix=".request-")
+NO_PIN = object()  # a request or result written without the pin (older kits)
+
+
+def _write_json(sd: Path, name: str, data: dict) -> None:
+    """Atomic; each writer has its own temp file."""
+    fd, tmp = tempfile.mkstemp(dir=sd, prefix=f".{name}-")
     try:
         with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(request))
-        os.replace(tmp, sd / "request.json")
+            fh.write(json.dumps(data))
+        os.replace(tmp, sd / name)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
 
 
-def _pin_changed(repo: Path, sd: Path) -> bool:
-    """The repo's Node pin differs from the one the latest prep saw."""
+def _read_json(path: Path) -> dict:
     try:
-        data = json.loads(_read(sd / "request.json") or "")
+        data = json.loads(_read(path) or "")
     except ValueError:
-        return False
-    return isinstance(data, dict) and "pin" in data and data["pin"] != node_spec(repo)[0]
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _read_request(sd: Path, default: tuple[int | None, Path | None]) -> tuple[int | None, Path | None]:
+def _write_request(repo: Path, sd: Path, node_major: int | None, node_bin: Path | None, pin=NO_PIN) -> None:
+    """The inputs the latest prep asked for; a running install re-reads them when it finishes.
+    `pin` is the Node pin that chose node_major, read before the runtime was resolved, so a pin
+    edited meanwhile is never stored next to a Node it did not choose."""
+    _write_json(sd, "request.json", {"node": node_major, "node_bin": str(node_bin) if node_bin else None,
+                                     "pin": node_spec(repo)[0] if pin is NO_PIN else pin})
+
+
+def _write_built(sd: Path, pin) -> None:
+    """The pin of the request the installed result was built for."""
+    if pin is NO_PIN:
+        with contextlib.suppress(OSError):
+            (sd / "built.json").unlink()
+    else:
+        _write_json(sd, "built.json", {"pin": pin})
+
+
+def _pin_changed(repo: Path, sd: Path) -> bool:
+    """The repo's Node pin differs from the one the installed result was built for (else from
+    the one the latest prep saw)."""
+    for name in ("built.json", "request.json"):
+        data = _read_json(sd / name)
+        if "pin" in data:
+            return data["pin"] != node_spec(repo)[0]
+    return False
+
+
+def _read_request(sd: Path, default: tuple[int | None, Path | None]) -> tuple[int | None, Path | None, object]:
+    """(Node major, Node bin dir, pin) from one read of request.json, so the three agree."""
+    data = _read_json(sd / "request.json")
     try:
-        data = json.loads(_read(sd / "request.json") or "")
         major, node_bin = data["node"], data["node_bin"]
-    except (ValueError, TypeError, KeyError):
-        return default
-    return (major if isinstance(major, int) else None), (Path(node_bin) if node_bin else None)
+    except KeyError:
+        return (*default, NO_PIN)
+    return ((major if isinstance(major, int) else None), (Path(node_bin) if node_bin else None),
+            data.get("pin", NO_PIN))
 
 
-def _inputs_key(repo: Path, node_major: int | None, node_bin: Path | None) -> tuple:
-    return node_major, str(node_bin), tuple(_plan_stamp(repo, p, node_major) for p in install_plans(repo))
+def _inputs_key(repo: Path, node_major: int | None, node_bin: Path | None, pin=NO_PIN) -> tuple:
+    stamps = tuple(_plan_stamp(repo, p, node_major) for p in install_plans(repo))
+    return node_major, str(node_bin), pin, stamps
 
 
 def _install_round(repo: Path, node_major: int | None, node_bin: Path | None, sd: Path) -> tuple[int, str]:
@@ -630,11 +660,12 @@ def run_install(repo: Path, node_major: int | None, node_bin: Path | None) -> in
     for attempt in range(5):  # inputs that keep changing still end in a final status
         with open(sd / "lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            request = _read_request(sd, default)
+            major, bin_dir, pin = request = _read_request(sd, default)
             done = _inputs_key(repo, *request)
-            rc, status = _install_round(repo, *request, sd)
+            rc, status = _install_round(repo, major, bin_dir, sd)
             if attempt < 4 and _inputs_key(repo, *_read_request(sd, default)) != done:
                 status = "running (the inputs changed; installing again)"  # never a final status between rounds
+            _write_built(sd, pin)  # before the status, so a final status never meets an older pin
             (sd / "status").write_text(status + "\n")
         if _inputs_key(repo, *_read_request(sd, default)) == done:
             break
@@ -652,17 +683,19 @@ def _install_running(sd: Path) -> bool:
     return False
 
 
-def start_background_install(repo: Path, node_major: int | None, node_bin: Path | None) -> str:
+def start_background_install(repo: Path, node_major: int | None, node_bin: Path | None, pin=NO_PIN) -> str:
     plans = install_plans(repo)
     if not plans:
         return "no lockfile at the repo root; nothing to install"
     sd = state_dir(repo)
     cmds = ", ".join(" ".join(p[1]) for p in plans)
-    _write_request(repo, sd, node_major, node_bin)  # before the running check; see run_install
+    _write_request(repo, sd, node_major, node_bin, pin)  # before the running check; see run_install
     if all(plan_current(repo, p, node_major, sd) for p in plans):
-        if not (_read(sd / "status") or "").startswith("ok") and not _install_running(sd):
-            # a failed or interrupted install for other inputs left its status behind
-            (sd / "status").write_text("; ".join(f"ok {p[0]} (unchanged)" for p in plans) + "\n")
+        if not _install_running(sd):  # a running install records its own pin when it finishes
+            _write_built(sd, _read_request(sd, (None, None))[2])  # this Node's result already serves this pin
+            if not (_read(sd / "status") or "").startswith("ok"):
+                # a failed or interrupted install for other inputs left its status behind
+                (sd / "status").write_text("; ".join(f"ok {p[0]} (unchanged)" for p in plans) + "\n")
         return f"up to date ({', '.join(p[0] for p in plans)}: lockfiles and Node unchanged)"
     if _install_running(sd):
         return (f"an install is already running ({cmds}); it installs again if these inputs changed. "
@@ -683,7 +716,7 @@ def _settled(repo: Path, sd: Path, status: str) -> str:
     plans = install_plans(repo)
     if status.startswith("failed") or not plans:
         return status
-    node_major, _ = _read_request(sd, (None, None))
+    node_major = _read_request(sd, (None, None))[0]
     if _pin_changed(repo, sd) or not all(plan_current(repo, p, node_major, sd) for p in plans):
         return (f"stale: the lockfiles or Node changed after this install ({status}); "
                 "run `cloud-prep` to install again")
@@ -798,7 +831,7 @@ def prep(repo: Path, write_session_env: bool, primary: bool, deadline: float) ->
         except Exception as e:  # noqa: BLE001 — reported, never fatal
             problems = [str(e)]
         lines += [f"pnpm/yarn not ready: {p}" for p in problems]
-    lines.append("Dependencies: " + start_background_install(repo, major, node_bin))
+    lines.append("Dependencies: " + start_background_install(repo, major, node_bin, spec))
     lines.append("Landing: " + land_policy(repo_name(repo)))
     return lines
 

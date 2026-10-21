@@ -22,7 +22,7 @@ than adding a second one, so `claude --cloud` picks it without `/remote-env`.
 | `setup.sh` | Runs before Claude Code starts; the VM snapshot is cached ~7 days. Installs the kit into `/opt/claude-cloud-kit`, Node 24 and 26 (SHA-256 checked), `land` and `cloud-prep` on PATH, and `~/.claude/CLAUDE.md` plus `settings.json`. Every kit file is checked against `MANIFEST.sha256`, compiled and smoke-tested (the guard must allow `ls` and deny a push to `main`) before it replaces the current kit. The installer lock is an `flock` the kernel releases when its holder dies. |
 | `cloud-prep` (SessionStart) | Refreshes the kit (60 s cap), picks the repo's Node version (`.nvmrc`, `.node-version`, `mise.toml`, `.mise.toml`, `.tool-versions`, `engines`; ranges and `lts/<name>` understood), installs dependencies in the background (pnpm, npm, yarn, bun, uv, poetry; frozen lockfiles; skipped when the lockfile is unchanged), and tells Claude the landing policy. Foreground work has a 180 s budget; if the pinned Node can't be installed in it, cloud-prep uses the newest Node in `/opt` (else the one on PATH) and puts it on the session PATH. Repos that use pnpm or yarn get their corepack shims before the session starts. `cloud-prep --wait` blocks until the install is done, and reports `stale` when the lockfiles or the Node pin changed after the last install (run `cloud-prep` to install again). |
 | `land` | REST-only landing (the cloud GitHub proxy blocks GraphQL, so `gh pr` and zs-land cannot run). Push → open or reuse the PR → wait for CI → squash-merge → switch to the synced default branch. |
-| `hooks/guard.py` (PreToolUse) | A small allowlist. `git push` runs only as its own command, `[cd <path> &&] git push [-u] [-q] [--force-with-lease[=<ref>]] [--force-if-includes] [<remote> [<refspec>]]`, to a branch other than main, master or the default branch; any other command with the word `push` next to git, a push alias, a wrapper or a shell expansion is refused. The GitHub API (gh, curl, wget, httpie) is read-only apart from opening a PR, editing its title or body, and comments and reviews. psql, pg_dump and `supabase db`/`migration` reach local databases only. |
+| `hooks/guard.py` (PreToolUse) | A seatbelt for pushes, merges, direct API writes and remote databases. `git push` runs only as its own command, `[cd <path> &&] git push [-u] [-q] [--force-with-lease[=<ref>]] [--force-if-includes] [<remote> [<refspec>]]`, to a branch other than main, master or the default branch; any other command with the word `push` next to git, a wrapper or a shell expansion is refused, and so are git aliases and unknown git subcommands. Matching the raw command text, it refuses merges (`gh pr merge`, the merge endpoints, auto-merge), repo delete/archive/rename/edit/sync, rulesets and protection, API writes to contents, git refs and objects, hooks, Actions settings and environments, a remote database host next to a database or migration tool, remote `supabase` commands (`--linked`, `db push`, `link`, …) and database env vars set to a remote value. Cloud sessions can't change repo settings, rulesets or protection anyway: the Claude GitHub App has no administration write. |
 | `claude/CLAUDE.md` | Devin's working rules for cloud sessions: conventional commits, no AI attribution, how and when to land, no production data work. |
 | `claude/settings.json` | The two hooks, no attribution lines (commits, PRs, session links), longer Bash timeouts. |
 
@@ -37,14 +37,15 @@ than adding a second one, so `claude --cloud` picks it without `/remote-env`.
   the merge it waits until GitHub has computed mergeability, reads the default branch, CI
   and HEAD, then reads the PR once more, judges every PR condition on that last read, and
   pins the merge to the head SHA.
-- CI: every non-advisory check run (a re-run replaces an attempt only if it started after that attempt completed; overlapping same-named runs, such as matrix legs, are all judged) and
-  commit status must pass or be skipped, with at least one real pass. Failure, cancelled,
+- CI: every non-advisory check run in GitHub's latest view (the check-runs API's default
+  `filter=latest`, the view `gh pr checks` and zs-land judge: a re-run replaces its earlier
+  attempt) and commit status must pass or be skipped, with at least one real pass. Failure, cancelled,
   neutral, timed out and action required block. Only skips, or no checks, after 2 minutes
   fails closed (merge by hand on GitHub if a repo has no CI). A pass counts only 45 s after
   this run's push and its PR read, so PR workflows have time to register.
 - Once the check runs pass, `land` also requires `mergeable` true and `mergeable_state`
   `clean` or `has_hooks`: GitHub's own roll-up of every status and check. That covers commit
-  statuses the cloud GitHub app cannot read (403) and matrix legs. `unstable`, `blocked` or
+  statuses the cloud GitHub app cannot read (403). `unstable`, `blocked` or
   unknown waits `LAND_BLOCKED_WAIT`, then exits 1, so a failing advisory check means a merge
   by hand.
 - The squash commit message is the commit list, set explicitly. The cloud proxy appends a
@@ -84,7 +85,9 @@ fetch files without hashes and an old `land` can read this file; then remove the
 ## Changing the kit
 
 - Everything shipped reaches every session at its next start: the SessionStart hook
-  refreshes the kit from `main` and re-merges `~/.claude` config. It keeps the current kit if
+  refreshes the kit from `main`, and the refreshed installer re-merges `~/.claude` config.
+  The exception is the first session on a snapshot from before 2026-10-21, whose hook
+  refreshes only the kit (see Limits). The hook keeps the current kit if
   a fetch fails, a file does not match `MANIFEST.sha256` (raw.githubusercontent.com caches
   files for minutes, so right after a merge a session may keep the old kit once), or the new
   kit does not compile or pass its smoke test.
@@ -103,12 +106,25 @@ fetch files without hashes and an old `land` can read this file; then remove the
 - A Node pin narrower than a major (e.g. `<24.1`) installs that major's latest release.
   Poetry venvs outside the repo are not checked, so a deleted one is not reinstalled until
   `poetry.lock` or `pyproject.toml` changes.
-- The guard is a seatbelt for mistakes, not a sandbox. Branch rulesets on GitHub are the hard gate.
-  It refuses some harmless commands on purpose, such as `git commit -m "... push ..."` or
-  `cmd | xargs git ...`; split or reword them.
+- The guard is a seatbelt for mistakes, not a sandbox. Branch rulesets on GitHub are the hard
+  gate, and the Claude GitHub App's permissions (no administration write) keep repo settings,
+  rulesets and protection out of reach. The guard covers pushes, merges, direct writes through
+  the API, and remote databases by text match only; it does not inspect PR state or base
+  changes, GraphQL (the cloud proxy blocks it) or an API path held in a variable.
+- Because it matches raw text, it refuses some harmless commands on purpose: a commit message,
+  here-document or PR body that mentions `push`, `gh pr merge`, a ruleset or a remote database;
+  reads of `pulls/<n>/merge` or `rulesets`; `supabase db push --local`; psql or supabase with a
+  `$` anywhere. The refusal says how to split it: write the file in one command (or with the
+  Write tool), run the tool in another.
+- Keep cloud environments free of database credentials. The database rules know the common
+  hosted-Postgres hosts and loopback; they are not a boundary.
 - Cloud sessions act on GitHub as the signed-in user through the Claude GitHub App, so a
   ruleset bypass for repository admins also lets cloud sessions through. Leave the bypass
   list empty on repos where cloud sessions must not reach `main`.
+- `land` judges the check runs exactly as GitHub's latest view returns them, like zs-land:
+  serial matrix legs that share one static name count as one run, the newest.
+- The first session on a VM snapshot from before 2026-10-21 keeps that snapshot's ~/.claude
+  config; the next snapshot rebuild picks up the new config.
 - Draft PRs cannot be marked ready from the cloud (GraphQL only); `land` opens PRs ready.
 - Commit statuses are invisible to the cloud GitHub app until its permissions include them;
   `land` relies on the PR's mergeable state, always, in addition to the check runs (see above).

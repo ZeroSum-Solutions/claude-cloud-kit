@@ -361,6 +361,47 @@ def test_wait_reports_a_changed_node_pin_as_stale(tmp_path, state, monkeypatch):
     assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
 
 
+def test_a_pin_changed_while_node_resolves_reads_as_stale(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    node_dir = tmp_path / "opt" / "node24"
+    _exe(node_dir / "bin" / "node", "echo v24.16.0")
+
+    def install_node(major, deadline):
+        (repo / ".nvmrc").write_text("26\n")  # the pin changes while Node 24 installs
+        return node_dir
+
+    monkeypatch.setattr(prep, "install_node", install_node)
+    real_popen = prep.subprocess.Popen
+
+    def popen(argv, **kw):  # the background child runs inline; npm and git stay real processes
+        return prep.run_install(repo, 24, node_dir / "bin") if "--install" in argv else real_popen(argv, **kw)
+
+    monkeypatch.setattr(prep.subprocess, "Popen", popen)
+    prep.prep(repo, write_session_env=False, primary=True, deadline=time.monotonic() + 5)
+    assert json.loads((prep.state_dir(repo) / "request.json").read_text())["pin"] == "24"
+    assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
+
+
+def test_the_install_records_the_pin_of_the_request_it_built(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="24")
+    assert prep.run_install(repo, 24, None) == 0
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+    # A later prep reads lts/jod, which is also Node 24: nothing to install, and not stale.
+    (repo / ".nvmrc").write_text("lts/jod\n")
+    assert prep.start_background_install(repo, 24, None, pin="lts/jod").startswith("up to date")
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+
+
 def test_concurrent_requests_do_not_share_a_temp_file(tmp_path, state, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -634,7 +675,7 @@ def test_fallback_major_is_used_everywhere(tmp_path, state, monkeypatch):
     monkeypatch.setattr(prep, "install_node", no_node)
     started = []
     monkeypatch.setattr(prep, "start_background_install",
-                        lambda r, major, node_bin: started.append((major, node_bin)) or "installing")
+                        lambda r, major, node_bin, pin: started.append((major, node_bin)) or "installing")
     env_file = tmp_path / "env"
     monkeypatch.setenv("CLAUDE_ENV_FILE", str(env_file))
     lines = prep.prep(repo, write_session_env=True, primary=True, deadline=time.monotonic() + 5)
