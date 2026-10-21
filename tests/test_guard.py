@@ -16,12 +16,11 @@ spec.loader.exec_module(guard)
 @pytest.fixture
 def fake_git(monkeypatch):
     """Pretend the session repo is on feat/x with main as the default branch."""
-    state = {"branch": "feat/x", "default": "main", "push": None, "config": "", "aliases": {}}
+    state = {"branch": "feat/x", "default": "main", "push": None, "config": ""}
     monkeypatch.setattr(guard, "current_branch", lambda where: state["branch"])
     monkeypatch.setattr(guard, "default_branch", lambda where, remote="origin": state["default"])
     monkeypatch.setattr(guard, "push_target", lambda where: state["push"])
     monkeypatch.setattr(guard, "push_config", lambda where: state["config"])
-    monkeypatch.setattr(guard, "git_aliases", lambda where: state["aliases"])
     for name in ("PGHOST", "PGHOSTADDR", "PGSERVICE"):
         monkeypatch.delenv(name, raising=False)
     return state
@@ -156,17 +155,7 @@ BLOCKED = [
     "gh api -X POST repos/o/r/git/refs --input ref.json",
     "gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA==",
     "gh api -X DELETE repos/o/r/contents/README.md -f message=x -f sha=abc",
-    "gh api -X POST \"$URL\" -f x=1",
     "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
-    "gh api graphql -F query=@q.graphql",
-    "curl -X POST https://api.github.com/graphql -d '{\"query\":\"mutation { deleteRef(input: {}) { x } }\"}'",
-    # pull requests: state and base stay with `land`
-    "gh api -X PATCH repos/o/r/pulls/5 -f state=closed",
-    "gh api -X PATCH repos/o/r/pulls/5 -f base=main",
-    "gh api -X PATCH repos/o/r/pulls/5 --input -",
-    "curl -X PATCH https://api.github.com/repos/o/r/pulls/5 -d '{\"state\":\"closed\"}'",
-    "curl -X PATCH https://api.github.com/repos/o/r/pulls/5 -d @body.json",
-    "gh api -X POST repos/o/r/pulls/5/requested_reviewers -f reviewers[]=x",
     # repository settings, protection and rulesets
     "gh repo delete o/r --yes",
     "gh repo archive o/r -y",
@@ -175,13 +164,6 @@ BLOCKED = [
     "gh repo sync o/r --branch main --force",
     "gh ruleset list",
     "gh alias set m 'pr merge'",
-    "gh api -X DELETE repos/o/r",
-    "NWO=o/r; gh api -X DELETE repos/$NWO",
-    "gh api -X PATCH repos/o/r -F archived=true",
-    "gh api -X PATCH repos/o/r -f name=renamed",
-    "gh api -X PATCH repos/o/r -f default_branch=feat/x",
-    "gh api -X POST repos/o/r/transfer -f new_owner=x",
-    "gh api -X POST repos/o/r/branches/main/rename -f new_name=x",
     "gh api -X PUT repos/o/r/branches/main/protection --input p.json",
     "gh api -X DELETE repos/o/r/rulesets/7",
     "gh api -X PUT orgs/o/rulesets/1 --input r.json",
@@ -314,10 +296,72 @@ BYPASSES = [
     "curl -X PUT https://api.github.com/repositories/12345/pulls/5/merge",
     "gh api -X POST 'repos/o/r/pulls/5/comments/../../../merges' -f base=main",
     "gh api -X POST 'repos/o/r/pulls%2F5%2Fmerge'",
+    # Round 4, Sol
+    "psql --dbname='host=db.example.supabase.co dbname=app' -c 'delete from t'",
+    "psql -dhost=db.example.net -c 'delete from t'",
+    "supabase --dns-resolver https db push",
+    "supabase --log-level debug db push",
+    "npx --yes --package supabase supabase db push",
+    "npm exec --package supabase -- supabase db push",
+    "cd /other && git publish",
+    "git -C /other publish",
+    "git publish",
+    "cat <<EOF\n`gh api -X PUT repos/o/r/pulls/5/merge`\nEOF",
+    "curl -X PUT https://api.github.com./repos/o/r/pulls/5/merge",
+    "curl -X PUT https://API.GitHub.com./repos/o/r/contents/a -d '{}'",
+    # Round 4, Argon: here-documents and process substitution
+    "cat <<EOF\n$(gh pr merge 5 --squash)\nEOF",
+    "cat <<EOF\n$(gh api -X PUT repos/o/r/pulls/5/merge)\nEOF",
+    "cat <<EOF\n$(psql postgresql://postgres:pw@db.abc.supabase.co:5432/postgres -c \"drop table u\")\nEOF",
+    "cat <<'EOF' |\ngh pr merge 5\nEOF\nbash",
+    "gh api --input <(jq -n '{merge_method:\"squash\"}') -X PUT repos/o/r/pulls/5/merge",
+    "curl -d @<(echo '{}') -X PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "psql -f <(cat migration.sql) -h db.abc.supabase.co postgres",
+    # Round 4, Argon: connection strings
+    'psql --dbname="host=db.abc.supabase.co dbname=postgres"',
+    'psql -d"host=db.abc.supabase.co dbname=postgres"',
+    'psql "dbname=postgres;host=db.abc.supabase.co"',
+    'DATABASE_URL="host=db.abc.supabase.co dbname=postgres" psql',
+    # Round 4, Argon: quoted expansions, options before the subcommand, shells and wrappers
+    'F=-f; gh api repos/o/r/pulls/5/merge "$F" merge_method=squash',
+    'F=-X; curl "$F" PUT https://api.github.com/repos/o/r/pulls/5/merge',
+    'curl "$(echo -X)" PUT https://api.github.com/repos/o/r/pulls/5/merge',
+    'F=--linked; supabase db reset "$F"',
+    'A=pull; supabase db "$A"',
+    "gh -X PUT api repos/o/r/pulls/5/merge",
+    "gh -f merge_method=squash api repos/o/r/pulls/5/merge",
+    "supabase --env-file .env db pull",
+    'echo "gh pr merge 5 --squash" | bash',
+    'printf "gh api -X PUT repos/o/r/pulls/5/merge\\n" | sh',
+    'echo "supabase db reset --linked" | bash',
+    "env -C /tmp/echo gh pr merge 5",
+    "sudo -u printf gh api -X PUT repos/o/r/pulls/5/merge",
+    "cd /other-repo && git ship",
+    "git config alias.run '!sh s.sh' && git run",
 ]
 
-# Harmless commands the allowlist refuses on purpose: the price of not parsing shell.
+# Harmless commands refused on purpose: the price of matching raw text instead of parsing shell.
 REFUSED_ON_PURPOSE = [
+    # text that only mentions a guarded command
+    "echo 'gh pr merge 1'",
+    "echo gh pr merge 1",
+    "cat > notes.md <<'EOF'\ngh pr merge 5\nsupabase db reset --linked\nEOF",
+    "cat <<'EOF' > pr.md\n## Summary\n- Fix array.push bug\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nfeat: add web push notifications\nEOF\n)\"",
+    'gh pr create --title t --body "Turns on auto-merge for docs"',
+    'git commit -m "git hooks: run lint"',
+    # reads on paths the merge and settings rules match
+    "gh api repos/o/r/pulls/5/merge",
+    "gh api repos/o/r/rulesets",
+    # local database work the coarse rules can't tell from remote
+    "supabase db push --local",
+    "cp -r supabase $TMP/backup",
+    "psql -h localhost -c 'DO $$ BEGIN END $$;'",
+    "psql -h localhost -p $PORT app",
+    'DATABASE_URL="postgresql://postgres:postgres@localhost:$PORT/app" npm test',
+    'DATABASE_URL="sqlite:///$TMPDIR/test.db" pytest',
+    # git aliases, even harmless ones
+    "git co feat/x",
     "git push origin @",
     "git push --no-verify -u origin HEAD",
     "git push -u origin HEAD 2>&1 | tail -3",
@@ -335,7 +379,6 @@ REFUSED_ON_PURPOSE = [
     "supabase migration list --linked",
     "psql -h db.internal app",
     "cat > notes.md <<'EOF'\nsupabase db push\nEOF",
-    '"$PYTHON" -m pytest',
 ]
 
 ALLOWED = [
@@ -364,9 +407,6 @@ ALLOWED = [
     "git commit -m \"$(cat <<'EOF'\nfix: don't merge stale refs to main\n\nHandles \"quoted\" names (and merges).\nEOF\n)\"",
     "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\n- don't merge until CI is green\nEOF\n)\"",
     'echo "on $(git branch --show-current)"',
-    "echo 'gh pr merge 1'",
-    "echo gh pr merge 1",
-    "cat > notes.md <<'EOF'\ngh pr merge 5\nsupabase db reset --linked\nEOF",
     "gh pr view 5",
     "gh pr create --fill",
     "gh pr list --state open",
@@ -374,12 +414,10 @@ ALLOWED = [
     "gh repo view o/r",
     "gh run view 123 --log-failed",
     "gh api repos/o/r/pulls/5",
-    "gh api repos/o/r/pulls/5/merge",
     "gh api repos/o/r/commits/abc/check-runs",
     "gh api -X GET repos/o/r/pulls -f state=open",
     "gh api --method HEAD repos/o/r",
     "gh api 'repos/{owner}/{repo}/pulls?state=open' --jq '.[].number'",
-    "gh api repos/o/r/rulesets",
     "gh api repos/o/r/pulls -f title=t -f head=feat/x -f base=main",
     "gh api repositories/123/pulls -f title=t -f head=feat/x -f base=main",
     "gh api -X PATCH 'repos/{owner}/{repo}/pulls/5' -f title=x -f body='fix base layout'",
@@ -403,7 +441,6 @@ ALLOWED = [
     "supabase status",
     "supabase stop",
     "supabase db reset",
-    "supabase db push --local",
     "supabase db dump --local -f x.sql",
     "supabase migration new add_table",
     "supabase migration list",
@@ -427,6 +464,50 @@ ALLOWED = [
     "$HOME/.local/bin/uv run pytest",
     "for f in *.py; do python -m py_compile \"$f\"; done",
     "echo 'unclosed",
+    # round-4 false positives the raw-text rules allow
+    "gh api repos/o/r/pulls -f title=t -f head=feat/x -f base=main -f body='See postgresql://db.example.net/app'",
+    "gh api -X PATCH repos/o/r/pulls/5 -f body='Example {\"state\":\"open\"}'",
+    "gh api repos/o/r/actions/runs/$RUN_ID/jobs",
+    'gh api "repos/o/r/actions/runs/$RUN_ID/jobs"',
+    "gh api repos/o/r/pulls/$PR",
+    'gh api -f body="$MSG" repos/o/r/issues/5/comments',
+    "gh api -f body='run `pytest`' repos/o/r/issues/5/comments",
+    "curl -s https://api.github.com/repos/o/r/actions/runs/$RUN_ID/jobs",
+    "curl -s http://localhost:$PORT/health",
+    'curl -X POST "http://localhost:$PORT/api/items"',
+    "curl -fsSL https://api.github.com/repos/o/r/contents/README.md",
+    "rg supabase db",
+    "grep -r supabase db",
+    "git grep supabase db",
+    "pytest tests/http -k $TEST",
+    "supabase db diff -f new_migration",
+    "supabase db lint",
+    '"$PYTHON" -m pytest',
+    # everyday commands that must always pass
+    ("gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\n"
+     "- Adds this PR to the merge queue once CI passes; merges stay with land\nEOF\n)\""),
+    "gh api repos/o/r/pulls/5/comments",
+    "pnpm test",
+    "rg supabase src/",
+    "ls apps/gh",
+    'git commit -m "Move git hooks into scripts"',
+    "git -C /tmp/repo status",
+    "git lfs pull",
+]
+
+# Allowed on purpose: GitHub refuses these (the Claude GitHub App has no administration write),
+# the cloud proxy blocks GraphQL, or rulesets keep them off main. PR state and base are not inspected.
+ALLOWED_BY_DESIGN = [
+    'gh api -X POST "$URL" -f x=1',
+    "gh api graphql -F query=@q.graphql",
+    "curl -X POST -T mutation.json https://api.github.com/graphql",
+    "gh api -X PATCH repos/o/r/pulls/5 -f state=closed",
+    "gh api -X PATCH repos/o/r/pulls/5 -f base=main",
+    "curl -X PATCH -T close.json https://api.github.com/repos/o/r/pulls/5",
+    "gh api -X POST repos/o/r/pulls/5/requested_reviewers -f reviewers[]=x",
+    "gh api -X DELETE repos/o/r",
+    "gh api -X PATCH repos/o/r -f default_branch=feat/x",
+    "gh api -X POST repos/o/r/branches/main/rename -f new_name=x",
 ]
 
 
@@ -435,7 +516,7 @@ def test_blocked(fake_git, cmd):
     assert guard.decide(cmd, None), cmd
 
 
-@pytest.mark.parametrize("cmd", ALLOWED)
+@pytest.mark.parametrize("cmd", ALLOWED + ALLOWED_BY_DESIGN)
 def test_allowed(fake_git, cmd):
     assert guard.decide(cmd, None) is None, cmd
 
@@ -474,12 +555,12 @@ def test_configured_push_refspec(fake_git):
     assert guard.decide("git push origin HEAD:feat/x", None) is None
 
 
-def test_push_aliases(fake_git):
-    fake_git["aliases"] = {"p": "push origin main", "sh": "!sh -c 'git push'", "st": "status"}
-    assert guard.decide("git p", None)
-    assert guard.decide("git P", None)
-    assert guard.decide("git status && git sh", None)
-    assert guard.decide("git st", None) is None
+def test_unknown_git_subcommands(fake_git):
+    for cmd in ("git p", "git P", "git status && git sh", "git st", "timeout 60 git ship",
+                "bash -c 'git ship'", 'echo "$(git ship)"', "/usr/bin/git ship", "git -c x.y=1 ship"):
+        assert guard.ALIAS_HINT in guard.decide(cmd, None), cmd
+    for cmd in ("git status", "git -C /tmp/r log --oneline", "git --version", "GIT_TRACE=1 git fetch"):
+        assert guard.decide(cmd, None) is None, cmd
 
 
 def test_remote_db_from_environment(fake_git, monkeypatch):
@@ -490,13 +571,10 @@ def test_remote_db_from_environment(fake_git, monkeypatch):
     assert guard.decide("psql -c 'select 1'", None) is None
 
 
-def test_pr_patch_reads_input_file(fake_git, tmp_path):
-    (tmp_path / "ok.json").write_text('{"title": "x", "body": "rebase notes"}')
-    (tmp_path / "close.json").write_text('{"state": "closed"}')
-    cmd = "gh api -X PATCH repos/o/r/pulls/5 --input {}"
-    assert guard.decide(cmd.format("ok.json"), str(tmp_path)) is None
-    assert guard.decide(cmd.format("close.json"), str(tmp_path))
-    assert guard.decide(cmd.format("missing.json"), str(tmp_path))
+def test_text_match_says_how_to_split(fake_git):
+    for cmd in ("echo gh pr merge 1", "cat > n.md <<'EOF'\nsupabase db reset --linked\nEOF",
+                "psql postgresql://u@db.abc.supabase.co/app"):
+        assert "write the file in one command, run the tool in another" in guard.decide(cmd, None), cmd
 
 
 # ---------------------------------------------------------------- real repositories
@@ -595,14 +673,14 @@ def test_configured_push_destinations(make_repo):
     assert guard.decide("git push origin HEAD:feat/x", str(work))
 
 
-def test_push_alias_in_repo_config(make_repo):
+def test_aliases_refused_in_any_repo(make_repo):
     work = make_repo()
-    git(work, "config", "alias.ship", "push origin HEAD:main")
-    git(work, "config", "alias.run", "!git push")
+    other = make_repo("other")
+    git(other, "config", "alias.publish", "inner")
+    git(other, "config", "alias.inner", "push origin main")
     git(work, "config", "alias.co", "checkout")
-    assert guard.decide("git ship", str(work))
-    assert guard.decide("git run", str(work))
-    assert guard.decide("git co feat/x", str(work)) is None
+    for cmd in ("git co feat/x", f"cd {other} && git publish", f"git -C {other} publish"):
+        assert guard.decide(cmd, str(work)), cmd
 
 
 def test_hook_outside_cloud_allows(monkeypatch, capsys):
