@@ -2,8 +2,10 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import re
+import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -192,20 +194,68 @@ def test_pr_body_lists_commits():
     assert "- feat: a" in body and "- fix: b" in body and "## Test plan" in body
 
 
-# ------------------------------------------------ CI roll-up when statuses are unreadable
+
+
+def test_land_starts_with_an_older_kitpolicy(tmp_path, monkeypatch):
+    # an older installer can pair a new land with a kitpolicy that has no split_list
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "lib").mkdir()
+    shutil.copy(ROOT / "bin" / "land", tmp_path / "bin" / "land")
+    (tmp_path / "lib" / "kitpolicy.py").write_text("def policy_for(*a, **k):\n    return False, 'old'\n")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, "kitpolicy")
+    old = load("land_old_policy", str(tmp_path / "bin" / "land"))
+    assert old.split_list("a, b\nc d") == {"a", "b", "c d"}
+
+
+# ------------------------------------------------ CI gate: check runs, then GitHub's roll-up
 
 REPO = land.Repo(nwo="o/r", id=1, owner="o", default="main", delete_branch_on_merge=True)
 
 
-def fake_ci(monkeypatch, runs, mergeable_state, head="abc"):
+class Clock:
+    """Stands in for land's time module: sleeping moves the clock."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = Clock()
+    monkeypatch.setattr(land, "time", c)
+    return c
+
+
+def live_pr(mergeable_state="clean", head="abc", mergeable=True, **extra):
+    return {"number": 1, "state": "open", "draft": False, "mergeable": mergeable,
+            "mergeable_state": mergeable_state, "head": {"sha": head}, "base": {"ref": "main"}, **extra}
+
+
+def fake_ci(monkeypatch, runs, mergeable_state="clean", head="abc", statuses=None, **extra):
+    """statuses=None: the token cannot read commit statuses (the cloud GitHub app)."""
+    reads = []
+
     def gh_list(path, key=None):
         if "/status" in path:
-            raise land.GhError(path, "Resource not accessible by integration")
+            if statuses is None:
+                raise land.GhError(path, "Resource not accessible by integration", 403)
+            return statuses
         return runs
 
+    def read_pr(repo, n):
+        reads.append(n)
+        return live_pr(mergeable_state, head, **extra)
+
     monkeypatch.setattr(land, "gh_list", gh_list)
-    monkeypatch.setattr(land, "read_pr", lambda repo, n: {
-        "mergeable": True, "mergeable_state": mergeable_state, "head": {"sha": head}})
+    monkeypatch.setattr(land, "read_pr", read_pr)
+    return reads
 
 
 def test_rollup_clean_passes(monkeypatch):
@@ -214,32 +264,34 @@ def test_rollup_clean_passes(monkeypatch):
     assert verdict.state == "pass" and rollup == "ok"
 
 
-def test_rollup_unstable_waits(monkeypatch):
-    fake_ci(monkeypatch, [run("check")], "unstable")
-    assert land.ci_state(REPO, 1, "abc", "u", set())[1] == "wait"
+@pytest.mark.parametrize("statuses", [None, []], ids=["statuses-unreadable", "statuses-readable"])
+@pytest.mark.parametrize("state", ["unstable", "blocked"])
+def test_rollup_gates_whether_or_not_statuses_are_readable(monkeypatch, statuses, state):
+    fake_ci(monkeypatch, [run("check")], state, statuses=statuses)
+    assert land.ci_state(REPO, 1, "abc", "u", set())[1] == state
 
 
-def test_rollup_blocked_is_reported(monkeypatch):
-    fake_ci(monkeypatch, [run("check")], "blocked")
-    assert land.ci_state(REPO, 1, "abc", "u", set())[1] == "blocked"
+def test_rollup_needs_mergeable_true(monkeypatch):
+    fake_ci(monkeypatch, [run("check")], "clean", mergeable=None)
+    assert land.ci_state(REPO, 1, "abc", "u", set())[1] != "ok"
 
 
 def test_rollup_dirty_stops(monkeypatch):
-    fake_ci(monkeypatch, [run("check")], "dirty")
-    with pytest.raises(land.Stop):
+    fake_ci(monkeypatch, [run("check")], "dirty", mergeable=False)
+    with pytest.raises(land.Stop, match="conflicts"):
         land.ci_state(REPO, 1, "abc", "u", set())
 
 
 def test_rollup_head_moved_stops(monkeypatch):
     fake_ci(monkeypatch, [run("check")], "clean", head="other")
-    with pytest.raises(land.Stop):
+    with pytest.raises(land.Stop, match="head changed"):
         land.ci_state(REPO, 1, "abc", "u", set())
 
 
 def test_other_status_errors_are_not_swallowed(monkeypatch):
     def gh_list(path, key=None):
         if "/status" in path:
-            raise land.GhError(path, "Server Error")
+            raise land.GhError(path, "Server Error", 500)
         return [run("check")]
 
     monkeypatch.setattr(land, "gh_list", gh_list)
@@ -247,9 +299,216 @@ def test_other_status_errors_are_not_swallowed(monkeypatch):
         land.ci_state(REPO, 1, "abc", "u", set())
 
 
-def test_wait_fails_closed_on_only_skipped(monkeypatch):
+def test_wait_fails_closed_on_only_skipped(monkeypatch, clock):
     fake_ci(monkeypatch, [run("a", conclusion="skipped")], "clean")
     monkeypatch.setattr(land, "NO_CI_GRACE", 0)
-    monkeypatch.setattr(land.time, "sleep", lambda s: None)
     with pytest.raises(land.Stop, match="only skipped"):
-        land.wait_for_ci(REPO, 1, "abc", "u", set(), None)
+        land.wait_for_ci(REPO, 1, "abc", "u", set(), clock.t)
+
+
+def test_rollup_catches_a_collapsed_matrix_leg(monkeypatch, clock):
+    # two matrix legs with one static name share a suite: latest_runs keeps only the pass
+    legs = [run("test", conclusion="failure", suite=1, rid=10), run("test", suite=1, rid=11)]
+    assert land.judge(land.latest_runs(legs), [], set()).state == "pass"
+    fake_ci(monkeypatch, legs, "unstable", statuses=[])
+    with pytest.raises(land.Stop, match="unstable"):
+        land.wait_for_ci(REPO, 1, "abc", "u", set(), clock.t)
+
+
+@pytest.mark.parametrize("state", ["unstable", "blocked"])
+def test_unstable_and_blocked_stop_after_the_bounded_wait(monkeypatch, clock, state):
+    fake_ci(monkeypatch, [run("check"), run("coderabbit", conclusion="failure")], state)
+    start = clock.t
+    with pytest.raises(land.Stop) as stop:
+        land.wait_for_ci(REPO, 1, "abc", "u", {"coderabbit"}, start)
+    msg = str(stop.value)
+    assert stop.value.code == 1
+    assert land.BLOCKED_WAIT <= clock.t - start < land.BLOCKED_WAIT + 2 * land.POLL
+    assert "coderabbit [failure]" in msg and "advisory" in msg and "merge by hand" in msg
+
+
+def test_pass_waits_for_the_settle_window_after_the_push(monkeypatch, clock):
+    fake_ci(monkeypatch, [run("check")], "clean")
+    pushed_at = clock.t
+    assert land.wait_for_ci(REPO, 1, "abc", "u", set(), pushed_at).state == "pass"
+    assert clock.t - pushed_at >= land.PR_SETTLE
+
+
+def test_settle_window_starts_at_this_runs_push_for_a_reused_pr(monkeypatch, clock):
+    seen = {}
+    monkeypatch.setattr(land, "resolve_repo", lambda: REPO)
+    monkeypatch.setattr(land, "preflight", lambda repo: ("feat/x", ["feat: x"]))
+    monkeypatch.setattr(land, "policy_for", lambda *a, **k: (True, "owner allowlisted"))
+    monkeypatch.setattr(land, "git", lambda *a, **k: "abc" if a == ("rev-parse", "HEAD") else "")
+
+    def push(cmd, **kw):
+        clock.t += 7
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(land, "subprocess", SimpleNamespace(run=push))
+    # a PR an earlier run opened: the window still counts from this run's push
+    monkeypatch.setattr(land, "find_or_open_pr", lambda *a: {"number": 1, "html_url": "u", "draft": False})
+
+    def wait(repo, number, sha, url, advisory, pushed_at):
+        seen["pushed_at"] = pushed_at
+        raise land.Stop("stop here")
+
+    monkeypatch.setattr(land, "wait_for_ci", wait)
+    with pytest.raises(land.Stop, match="stop here"):
+        land.main([])
+    assert seen["pushed_at"] == 1007.0
+
+
+# ------------------------------------------------ recheck: the PR is read last, once
+
+def fake_recheck(monkeypatch, runs=None, **pr):
+    monkeypatch.setattr(land, "gh_api", lambda path, *a, **k: {"default_branch": "main"})
+    monkeypatch.setattr(land, "git", lambda *a, **k: "abc")
+    order = []
+    monkeypatch.setattr(land, "gh_list", lambda path, key=None: order.append(path) or ([] if "/status" in path else runs or [run("check")]))
+
+    def read_pr(repo, n):
+        order.append("pr")
+        return live_pr(**pr)
+
+    monkeypatch.setattr(land, "read_pr", read_pr)
+    return order
+
+
+def test_recheck_reads_the_pr_last_and_once(monkeypatch):
+    order = fake_recheck(monkeypatch)
+    assert land.recheck(REPO, 1, "abc", "u", set())["mergeable_state"] == "clean"
+    assert order[-1] == "pr" and order.count("pr") == 1
+
+
+@pytest.mark.parametrize("pr", [
+    {"mergeable_state": "unstable"},
+    {"mergeable_state": "blocked"},
+    {"mergeable": None},
+    {"state": "closed"},
+    {"draft": True},
+    {"head": "other"},
+    {"base": {"ref": "release"}},
+], ids=["unstable", "blocked", "mergeable-null", "closed", "draft", "head-moved", "base-moved"])
+def test_recheck_judges_every_condition_on_the_one_pr_read(monkeypatch, pr):
+    order = fake_recheck(monkeypatch, **pr)
+    with pytest.raises(land.Stop):
+        land.recheck(REPO, 1, "abc", "u", set())
+    assert order.count("pr") == 1
+
+
+# ------------------------------------------------ merge: refused vs unknown
+
+PR = {"number": 1, "html_url": "u", "title": "feat: x"}
+
+
+def fake_merge(monkeypatch, put_error, gets):
+    gets = list(gets)
+
+    def gh_api(path, method="GET", body=None):
+        if method == "PUT":
+            raise put_error
+        item = gets.pop(0) if len(gets) > 1 else gets[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(land, "gh_api", gh_api)
+
+
+@pytest.mark.parametrize("status", [405, 409, 422])
+def test_merge_refused_means_nothing_merged(monkeypatch, clock, status):
+    fake_merge(monkeypatch, land.GhError("m", "Pull Request is not mergeable", status), [{"merged": False}])
+    with pytest.raises(land.Stop, match="refused") as stop:
+        land.merge(REPO, PR, "abc", ["feat: x"])
+    assert stop.value.code == 1
+
+
+@pytest.mark.parametrize("error", [land.GhError("m", "Bad Gateway", 502), ValueError("Expecting value"), OSError("reset")],
+                         ids=["5xx", "undecodable", "network"])
+def test_merge_unknown_result_is_exit_3_never_1(monkeypatch, clock, error):
+    fake_merge(monkeypatch, error, [land.GhError("p", "Bad Gateway", 502), {"merged": False}])
+    start = clock.t
+    with pytest.raises(land.Stop, match="unknown") as stop:
+        land.merge(REPO, PR, "abc", ["feat: x"])
+    assert stop.value.code == 3 and clock.t - start >= 30
+
+
+def test_merge_unknown_result_recovers_when_github_reports_merged(monkeypatch, clock):
+    merged = {"merged": True, "merge_commit_sha": "m1", "head": {"sha": "abc"}}
+    fake_merge(monkeypatch, ValueError("Expecting value"), [land.GhError("p", "Bad Gateway", 502), {"merged": False}, merged])
+    assert land.merge(REPO, PR, "abc", ["feat: x"]) == "m1"
+
+
+# ------------------------------------------------ after the merge
+
+class FakeGit:
+    def __init__(self, top, fail=()):
+        self.top, self.fail, self.calls = str(top), set(fail), []
+
+    def git(self, *args, check=True):
+        self.calls.append(args)
+        if args in self.fail:
+            if check:
+                raise land.Stop(f"git {' '.join(args)} failed")
+            return ""
+        if args == ("rev-parse", "--show-toplevel"):
+            return self.top
+        return "abc" if args == ("rev-parse", "HEAD") else ""
+
+    def git_ok(self, *args):
+        self.calls.append(args)
+        return args not in self.fail
+
+
+def fake_after(monkeypatch, tmp_path, fail=(), remote_head="abc", pr_reads=None):
+    g = FakeGit(tmp_path, fail)
+    monkeypatch.setattr(land, "git", g.git)
+    monkeypatch.setattr(land, "git_ok", g.git_ok)
+    reads = list(pr_reads or [{"merged": True, "merge_commit_sha": "m1"}])
+    api = []
+
+    def gh_api(path, method="GET", body=None):
+        api.append((method, path))
+        if "/pulls/" in path:
+            item = reads.pop(0) if len(reads) > 1 else reads[0]
+            if isinstance(item, Exception):
+                raise item
+            return item
+        if "/git/ref/" in path:
+            return {"object": {"sha": remote_head}}
+        return {}
+
+    monkeypatch.setattr(land, "gh_api", gh_api)
+    monkeypatch.chdir(ROOT)
+    return g, api
+
+
+def test_after_merge_fetches_with_an_explicit_refspec_from_the_toplevel(monkeypatch, clock, tmp_path):
+    g, _ = fake_after(monkeypatch, tmp_path)
+    problems, where = land.after_merge(REPO, PR, "feat/x", "abc", "m1")
+    assert problems == [] and where == "main"
+    assert ("fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main") in g.calls
+    assert Path.cwd() == tmp_path.resolve()
+
+
+def test_after_merge_retries_the_pr_read(monkeypatch, clock, tmp_path):
+    fake_after(monkeypatch, tmp_path, pr_reads=[land.GhError("p", "Bad Gateway", 502), {"merged": False},
+                                                {"merged": True, "merge_commit_sha": "m1"}])
+    assert land.after_merge(REPO, PR, "feat/x", "abc", "m1")[0] == []
+
+
+@pytest.mark.parametrize("remote_head,deleted", [("abc", True), ("pushed-later", False)])
+def test_remote_branch_is_deleted_only_at_the_merged_head(monkeypatch, clock, tmp_path, remote_head, deleted):
+    repo = land.Repo(nwo="o/r", id=1, owner="o", default="main", delete_branch_on_merge=False)
+    _, api = fake_after(monkeypatch, tmp_path, remote_head=remote_head)
+    assert land.after_merge(repo, PR, "feat/x", "abc", "m1")[0] == []
+    assert (("DELETE", "repos/o/r/git/refs/heads/feat/x") in api) is deleted
+
+
+def test_after_merge_detaches_when_the_default_branch_is_in_another_worktree(monkeypatch, clock, tmp_path):
+    g, _ = fake_after(monkeypatch, tmp_path, fail={("switch", "-q", "main")})
+    problems, where = land.after_merge(REPO, PR, "feat/x", "abc", "m1")
+    assert problems == [] and "detached" in where
+    assert ("switch", "-q", "--detach", "origin/main") in g.calls
+    assert ("update-ref", "-d", "refs/heads/feat/x", "abc") in g.calls
