@@ -11,9 +11,26 @@ claude.ai/code → environment selector → **Default** → edit → **Setup scr
 curl -fsSL https://raw.githubusercontent.com/ZeroSum-Solutions/claude-cloud-kit/main/setup.sh | bash || true
 ```
 
-Keep network access on **Trusted** (the kit needs nodejs.org, npm, PyPI and
-raw.githubusercontent.com, which are all on that list). Edit the Default environment rather
-than adding a second one, so `claude --cloud` picks it without `/remote-env`.
+Network access: **Limited** with **Allow package managers** checked (the kit needs nodejs.org,
+npm, PyPI and raw.githubusercontent.com, which are all on that default list), plus these
+**Allowed domains** so `docker pull` works for a local Supabase stack:
+
+```text
+registry-1.docker.io
+auth.docker.io
+production.cloudflare.docker.com
+production.cloudfront.docker.com
+ghcr.io
+pkg-containers.githubusercontent.com
+public.ecr.aws
+d5l0dvt14r5h8.cloudfront.net
+```
+
+The default list names the registries but not where two of them serve image layers from:
+GHCR redirects to `pkg-containers.githubusercontent.com` and ECR Public to a CloudFront host
+(`d5l0dvt14r5h8.cloudfront.net` on 2026-10-21). If an ECR pull fails with `host_not_allowed`,
+the error names the new host; add it. Edit the Default environment rather than adding a second
+one, so `claude --cloud` picks it without `/remote-env`.
 
 ## What a session gets
 
