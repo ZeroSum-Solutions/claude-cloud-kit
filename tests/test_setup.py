@@ -27,11 +27,11 @@ def test_manifests_are_current():
     assert (ROOT / "MANIFEST.sha256").read_text() == hashed, "run scripts/write-manifest"
 
 
-def run_setup(tmp_path, *args, home=None, raw=None, lock_wait="30"):
-    env = dict(os.environ, PATH=PATH, CLOUD_KIT_LOCK_WAIT=lock_wait,
+def run_setup(tmp_path, *args, home=None, raw=None, lock_wait="30", bin_dir=None, path=PATH):
+    env = dict(os.environ, PATH=path, CLOUD_KIT_LOCK_WAIT=lock_wait,
                CLOUD_KIT_RAW=raw or f"file://{ROOT}",
                CLOUD_KIT_DIR=str(tmp_path / "opt" / "claude-cloud-kit"),
-               CLOUD_KIT_BIN=str(tmp_path / "bin"),
+               CLOUD_KIT_BIN=str(bin_dir or tmp_path / "bin"),
                CLOUD_KIT_SKIP_NODE="1",
                HOME=str(home or tmp_path / "home"))
     (tmp_path / "opt").mkdir(exist_ok=True)
@@ -150,3 +150,101 @@ def test_a_held_lock_skips_the_run(tmp_path):
     proc = run_setup(tmp_path, "--refresh", lock_wait="1")
     assert proc.returncode == 0
     assert "another kit install is running" in proc.stderr
+
+
+def test_a_lock_we_do_not_own_is_left_alone(tmp_path):
+    assert run_setup(tmp_path).returncode == 0
+    lock = tmp_path / "opt" / "claude-cloud-kit.lock"
+    lock.mkdir()
+    (lock / "owner").write_text("someone-else\n")
+    run_setup(tmp_path, "--refresh", lock_wait="1")
+    assert (lock / "owner").read_text() == "someone-else\n"
+    lock.joinpath("owner").unlink()
+    lock.rmdir()
+    assert run_setup(tmp_path, "--refresh").returncode == 0
+    assert not lock.exists()
+
+
+def test_a_kit_left_only_as_old_is_restored(tmp_path):
+    """An installer killed between `mv $KIT $KIT.old` and `mv $STAGE $KIT`."""
+    assert run_setup(tmp_path).returncode == 0
+    kit = tmp_path / "opt" / "claude-cloud-kit"
+    kit.rename(tmp_path / "opt" / "claude-cloud-kit.old")
+    proc = run_setup(tmp_path, "--refresh", raw="file:///nonexistent")
+    assert proc.returncode == 0 and "restored the kit" in proc.stderr
+    assert (kit / "bin" / "land").is_file()
+    assert not (tmp_path / "opt" / "claude-cloud-kit.old").exists()
+    # and a full run installs over a leftover .old
+    kit.rename(tmp_path / "opt" / "claude-cloud-kit.old")
+    assert run_setup(tmp_path).returncode == 0
+    assert (kit / "bin" / "land").is_file() and not (tmp_path / "opt" / "claude-cloud-kit.old").exists()
+
+
+def test_a_killed_refresh_cleans_up(tmp_path):
+    assert run_setup(tmp_path).returncode == 0
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "curl").write_text("#!/bin/sh\nkill -TERM $PPID\nexit 1\n")
+    (fake / "curl").chmod(0o755)
+    proc = run_setup(tmp_path, "--refresh", path=f"{fake}:{PATH}")
+    assert proc.returncode != 0
+    opt = tmp_path / "opt"
+    assert (opt / "claude-cloud-kit" / "bin" / "land").is_file()
+    assert not list(opt.glob(".claude-cloud-kit.*")) and not (opt / "claude-cloud-kit.lock").exists()
+
+
+def test_user_hooks_in_a_kit_group_are_kept(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    mixed = {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "python3 /opt/claude-cloud-kit/hooks/guard.py", "timeout": 5},
+        {"type": "command", "command": "my-own-check"}]}
+    (home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [mixed]}}))
+    assert run_setup(tmp_path, home=home).returncode == 0
+    groups = json.loads((home / ".claude" / "settings.json").read_text())["hooks"]["PreToolUse"]
+    commands = [h["command"] for g in groups for h in g["hooks"]]
+    assert commands.count("my-own-check") == 1
+    assert commands.count("python3 /opt/claude-cloud-kit/hooks/guard.py") == 1  # the kit's, timeout 10
+    assert all(g["hooks"] for g in groups)
+
+
+def test_refresh_refuses_a_kit_whose_policy_is_empty(tmp_path):
+    assert run_setup(tmp_path).returncode == 0
+    raw = copy_tree(tmp_path / "raw")
+    (raw / "policy" / "client-repos.txt").write_text("# nothing\n")
+    _rehash(raw)
+    proc = run_setup(tmp_path, "--refresh", raw=f"file://{raw}")
+    assert "failed verification" in proc.stderr and "no entries" in proc.stderr
+    assert "# nothing" not in (tmp_path / "opt" / "claude-cloud-kit" / "policy" / "client-repos.txt").read_text()
+
+
+def test_refresh_refuses_a_kit_whose_cloud_prep_fails(tmp_path):
+    assert run_setup(tmp_path).returncode == 0
+    raw = copy_tree(tmp_path / "raw")
+    (raw / "bin" / "cloud-prep").write_text("#!/usr/bin/env python3\nimport no_such_module\n")
+    _rehash(raw)
+    proc = run_setup(tmp_path, "--refresh", raw=f"file://{raw}")
+    assert "failed verification" in proc.stderr
+    assert "no_such_module" not in (tmp_path / "opt" / "claude-cloud-kit" / "bin" / "cloud-prep").read_text()
+
+
+def test_missing_bin_dir_is_created_and_link_failure_keeps_config(tmp_path):
+    bin_dir = tmp_path / "nested" / "bin"
+    assert run_setup(tmp_path, bin_dir=bin_dir).returncode == 0
+    assert (bin_dir / "land").resolve() == (tmp_path / "opt" / "claude-cloud-kit" / "bin" / "land").resolve()
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file, not a dir")
+    home = tmp_path / "home2"
+    proc = run_setup(tmp_path, "--refresh", home=home, bin_dir=blocked / "bin")
+    assert "could not link" in proc.stderr
+    assert (home / ".claude" / "settings.json").is_file()
+
+
+def test_failed_claude_md_copy_is_reported(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md.tmp").symlink_to(tmp_path / "missing-dir" / "x")
+    proc = run_setup(tmp_path, home=home)
+    assert "could not write ~/.claude/CLAUDE.md" in proc.stderr
+    assert "could not write ~/.claude config" in proc.stderr
+    assert (home / ".claude" / "settings.json").is_file()  # the merge still ran
