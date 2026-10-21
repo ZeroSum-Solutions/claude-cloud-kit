@@ -360,6 +360,9 @@ BYPASSES += [
     "git -c x=stash push origin main",
     "git --namespace=stash push origin main",
     "git --namespace stash push origin main",
+    # round 6 (Sol): attached gh api fields are writes
+    "gh api repos/o/r/git/refs -f'ref=refs/heads/backup' -f\"sha=$(git rev-parse HEAD)\"",
+    "gh api repos/o/r/git/refs -Fsha=abc -fref=refs/heads/x",
 ]
 
 # Harmless commands refused on purpose: the price of matching raw text instead of parsing shell.
@@ -380,12 +383,11 @@ REFUSED_ON_PURPOSE = [
     "gh api repos/o/r/rulesets",
     # local database work the coarse rules can't tell from remote
     "supabase db push --local",
-    "cp -r supabase $TMP/backup",
     "psql -h localhost -c 'DO $$ BEGIN END $$;'",
     "psql -h localhost -p $PORT app",
     'DATABASE_URL="postgresql://postgres:postgres@localhost:$PORT/app" npm test',
     'DATABASE_URL="sqlite:///$TMPDIR/test.db" pytest',
-    # git aliases, even harmless ones
+    # pushes other than the plain form, even harmless ones
     "git push origin @",
     "git push --no-verify -u origin HEAD",
     "git push -u origin HEAD 2>&1 | tail -3",
@@ -527,6 +529,30 @@ ALLOWED = [
     'git commit -m "Move git hooks into scripts"',
     "git -C /tmp/repo status",
     "git lfs pull",
+    # round-6 false positives: tools only count in command position, GitHub paths only as API paths
+    "git commit -m \"$(cat <<'EOF'\nfeat(supabase): add RLS policies for profiles\nEOF\n)\"",
+    "git commit -m 'fix(supabase): handle `null` session on sign-out'",
+    'git commit -m "feat(supabase): add magic link login"',
+    ("gh api repos/o/r/pulls -f title=\"feat(supabase): add RLS\" -f head=feat/x -f base=main "
+     "-f body=\"$(cat <<'EOF'\n## Summary\n- Add RLS policies\nEOF\n)\""),
+    "gh api repos/o/r/issues/5/comments -f body='Updated `supabase` client config'",
+    'pytest tests/supabase -k "$TEST"',
+    "cp -r supabase $TMP/backup",
+    'gh api repos/o/r/pulls -f title="feat: auth" -f head=feat/x -f base=main -f body="Updated src/hooks/useAuth.ts"',
+    "gh api -X POST repos/o/r/pulls/5/comments -f body=nit -f commit_id=abc -f path=src/hooks/useAuth.ts -F line=10",
+    'gh api repos/o/r/issues/5/comments -f body="Fixed in ./hooks/guard.py"',
+    "gh api -X GET repos/o/r/contents/README.md -f ref=feat/x",
+    "git commit -m \"$(cat <<'EOF'\ndocs: add local psql usage\nEOF\n)\"",
+    "git commit -m 'docs: run `psql` against 127.0.0.1'",
+    "psql -h 127.0.0.1 -U postgres -c \"SELECT * FROM tenants WHERE host = 'example.com'\"",
+    "psql -h 127.0.0.1 -U postgres -c \"SELECT * FROM jobs WHERE service = 'billing'\"",
+    "pg_dump -h 127.0.0.1 postgres > dump.sql && du -h dump.sql",
+    'git commit -m "fix: repo sync timeout"',
+    'gh api repos/o/r/pulls -f title="feat: repo edit modal" -f head=feat/x -f base=main',
+    "pytest tests/protection",
+    "gh api repos/o/r/pulls -f title=t -f head=feat/x -f base=main -f body='Updated src/hooks/useAuth.ts'",
+    "git commit -m 'docs: explain `supabase start` readiness'",
+    "DATABASE_URL='host=127.0.0.1 dbname=test_db' python -m pytest -q",
 ]
 
 # Allowed on purpose: GitHub refuses these (the Claude GitHub App has no administration write),
@@ -609,6 +635,38 @@ def test_remote_db_from_environment(fake_git, monkeypatch):
     assert guard.decide("psql -h localhost -c 'select 1'", None) is None
     monkeypatch.setenv("PGHOST", "localhost")
     assert guard.decide("psql -c 'select 1'", None) is None
+
+
+def test_inherited_pghost_with_empty_uri_host(fake_git, monkeypatch):
+    # Sol round 6: libpq fills an empty URI host from PGHOST.
+    monkeypatch.setenv("PGHOST", "db.example.supabase.co")
+    assert guard.decide("psql postgresql:///app -c 'select 1'", None)
+    assert guard.decide("psql 'host= dbname=app'", None)
+    monkeypatch.setenv("PGHOST", "db.internal")
+    assert guard.decide("psql postgresql:///app", None)
+    assert guard.decide("DATABASE_URL='dbname=x host=db.internal' npm test", None)
+
+
+def test_non_origin_default_not_inspected(fake_git, monkeypatch):
+    # README Limits: the guard judges main, master and origin's default branch. A branch that tracks
+    # another remote whose default differs (upstream/release) is left to that repo's rulesets.
+    monkeypatch.setattr(guard, "default_branch",
+                        lambda where, remote="origin": "release" if remote == "upstream" else "main")
+    fake_git.update(branch="release", push="release")
+    assert guard.decide("git push", None) is None
+    assert guard.decide("git push upstream release", None)  # a named remote is judged by its own default
+
+
+def test_long_wrapper_chains_stay_fast(fake_git):
+    # A flag value that could also be the next wrapper made the command-position regex backtrack
+    # exponentially (`sudo -u sudo -u ...` hung the hook).
+    import time
+    wrapper = "su" + "do"
+    for chunk in (f"{wrapper} -u ", f"{wrapper} -u A=1 ", "nice -n 5 ", "env -i ", "npx -y "):
+        start = time.monotonic()
+        guard.decide(chunk * 60 + "psql -h db.example.net", None)
+        assert time.monotonic() - start < 1
+    assert guard.decide(f"{wrapper} -u 1000 env -i A=1 nice -n 5 psql -h db.example.net", None)
 
 
 def test_text_match_says_how_to_split(fake_git):

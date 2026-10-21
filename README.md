@@ -22,7 +22,7 @@ than adding a second one, so `claude --cloud` picks it without `/remote-env`.
 | `setup.sh` | Runs before Claude Code starts; the VM snapshot is cached ~7 days. Installs the kit into `/opt/claude-cloud-kit`, Node 24 and 26 (SHA-256 checked), `land` and `cloud-prep` on PATH, and `~/.claude/CLAUDE.md` plus `settings.json`. Every kit file is checked against `MANIFEST.sha256`, compiled and smoke-tested (the guard must allow `ls` and deny a push to `main`) before it replaces the current kit. The installer lock is an `flock` the kernel releases when its holder dies. |
 | `cloud-prep` (SessionStart) | Refreshes the kit (60 s cap), picks the repo's Node version (`.nvmrc`, `.node-version`, `mise.toml`, `.mise.toml`, `.tool-versions`, `engines`; ranges and `lts/<name>` understood), installs dependencies in the background (pnpm, npm, yarn, bun, uv, poetry; frozen lockfiles; skipped when the lockfile is unchanged), and tells Claude the landing policy. Foreground work has a 180 s budget; if the pinned Node can't be installed in it, cloud-prep uses the newest Node in `/opt` (else the one on PATH) and puts it on the session PATH. Repos that use pnpm or yarn get their corepack shims before the session starts. `cloud-prep --wait` blocks until the install is done, and reports `stale` when the lockfiles or the Node pin changed after the last install (run `cloud-prep` to install again). |
 | `land` | REST-only landing (the cloud GitHub proxy blocks GraphQL, so `gh pr` and zs-land cannot run). Push → open or reuse the PR → wait for CI → squash-merge → switch to the synced default branch. |
-| `hooks/guard.py` (PreToolUse) | A seatbelt for pushes, merges, direct API writes and remote databases. `git push` runs only as its own command, `[cd <path> &&] git push [-u] [-q] [--force-with-lease[=<ref>]] [--force-if-includes] [<remote> [<refspec>]]`, to a branch other than main, master or the default branch; any other command with the word `push` next to git, a wrapper or a shell expansion is refused. Matching the raw command text, it refuses merges (`gh pr merge`, the merge endpoints, auto-merge), repo delete/archive/rename/edit/sync, rulesets and protection, `gh api` writes to contents, git refs and objects, hooks, Actions settings and environments (any other client is refused on those api.github.com paths, reads included), a hosted-Postgres host anywhere in the command, `supabase` with a remote verb or flag (dump, pull, push, link, repair, fetch, inspect, `--linked`, `--db-url`, `--project-ref`; `--local` does not exempt them) and database env vars set to a remote value. Local work: `supabase start`, `supabase db reset`, `supabase migration up`. Cloud sessions can't change repo settings, rulesets or protection anyway: the Claude GitHub App has no administration write. |
+| `hooks/guard.py` (PreToolUse) | A seatbelt for pushes, merges, direct API writes and remote databases. `git push` runs only as its own command, `[cd <path> &&] git push [-u] [-q] [--force-with-lease[=<ref>]] [--force-if-includes] [<remote> [<refspec>]]`, to a branch other than main, master or the default branch; any other command with the word `push` next to git, a wrapper or a shell expansion is refused. Matching the raw command text, it refuses merges (`gh pr merge`, the merge endpoints, auto-merge), repo delete/archive/rename/edit/sync, rulesets and protection, `gh api` writes to contents, git refs and objects, hooks, Actions settings and environments (any other client is refused on those api.github.com paths, reads included), a hosted-Postgres host anywhere in the command, `supabase` in command position with a remote verb or flag (dump, pull, push, link, repair, fetch, inspect, `--linked`, `--db-url`, `--project-ref`; `--local` does not exempt them), psql, pg_dump, pg_restore, pgcli or usql in command position aimed at a non-local host (an empty host means the inherited `PGHOST`; a set `PGSERVICE` refuses) and database env vars set to a remote value. Local work: `supabase start`, `supabase db reset`, `supabase migration up`. Cloud sessions can't change repo settings, rulesets or protection anyway: the Claude GitHub App has no administration write. |
 | `claude/CLAUDE.md` | Devin's working rules for cloud sessions: conventional commits, no AI attribution, how and when to land, no production data work. |
 | `claude/settings.json` | The two hooks, no attribution lines (commits, PRs, session links), longer Bash timeouts. |
 
@@ -111,16 +111,24 @@ fetch files without hashes and an old `land` can read this file; then remove the
   rulesets and protection out of reach. The guard covers pushes, merges, direct writes through
   the API, and remote databases by text match only; it does not inspect PR state or base
   changes, GraphQL (the cloud proxy blocks it), an API path held in a variable, or git aliases
-  (a saved alias that pushes is not seen; the push ruleset still applies). A remote database
+  (a saved alias that pushes is not seen; the push ruleset still applies). A bare `git push` is
+  judged against main, master and origin's default branch; when the branch tracks another
+  remote whose default differs, that push is left to the remote's rulesets (name the remote,
+  `git push upstream <branch>`, and the guard checks that remote's default). A remote database
   host that is not on the hosted-Postgres list (Supabase, Neon, RDS, Render, Railway, Aiven,
   Cockroach) is caught only in a psql-style `-h`/`host=`/URL form.
 - Because it matches raw text, it refuses some harmless commands on purpose: a commit message,
   here-document or PR body that mentions `push`, `gh pr merge`, a ruleset or a remote database;
-  reads of `pulls/<n>/merge` or `rulesets`; any non-gh client reading api.github.com contents,
-  git refs or objects, hooks, Actions settings or environments (use `gh api`); a hosted-Postgres
-  host anywhere, even in an `echo` or an app's env var; `supabase` with dump, pull, push, link,
-  repair, fetch or inspect, `--local` included; psql or supabase with a `$` anywhere. The refusal says how to split it: write the file in one command (or with the
-  Write tool), run the tool in another.
+  reads of `pulls/<n>/merge` or `rulesets` API paths; any non-gh client reading api.github.com
+  contents, git refs or objects, hooks, Actions settings or environments (use `gh api`); a
+  hosted-Postgres host anywhere, even in an `echo` or an app's env var. supabase and the pg
+  clients count only in command position (after a separator, `$(`, a shell keyword, `VAR=x` or a
+  wrapper such as `env`, `npx`, `timeout`), but a here-document line or text after `;` that
+  starts with one is in command position, and so is the whole command once it is piped into a
+  shell, `eval`, `source` or `xargs`. There, `supabase` with dump, pull, push, link, repair,
+  fetch or inspect (`--local` included) and psql or supabase with a `$` are refused. The refusal
+  says how to split it: write the file in one command (or with the Write tool), run the tool in
+  another.
 - Keep cloud environments free of database credentials. The database rules know the common
   hosted-Postgres hosts and loopback; they are not a boundary.
 - Cloud sessions act on GitHub as the signed-in user through the Claude GitHub App, so a

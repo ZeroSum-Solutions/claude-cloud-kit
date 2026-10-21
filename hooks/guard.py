@@ -196,14 +196,27 @@ _FLAGS = r"(?:\s+-\S+(?:\s+[^-\s]\S*)?)*"  # flags between words: `gh pr -R o/r 
 _MERGE = re.compile(r"\bpulls/\S*/merge\b|/merges\b|/merge-upstream\b|\bpr\b" + _FLAGS + r"\s+merge\b"
                     r"|\bauto-merge\b|enablePullRequestAutoMerge|mergePullRequest")
 _GH_VARIABLE = re.compile(r"\b(?:gh|hub)\s+(?:(?:pr|repo)\s+)?[\"']?[$`]")  # gh pr $A
-_SETTINGS = re.compile(r"\brepo\b" + _FLAGS + r"\s+(?:delete|archive|rename|edit|sync)\b|\bruleset|/protection\b")
+# API paths only (api.github.com/repos/..., gh api repos/...): a source path such as src/hooks/x.ts in a body does not count
+_REPO = r"(?:api\.github\.com\.?/|(?<![\w/.-])/?)repos/[^/\s'\"]+/[^/\s'\"]+/"
+_SETTINGS = re.compile(r"\b(?:gh|hub)" + _FLAGS + r"\s+repo\b" + _FLAGS + r"\s+(?:delete|archive|rename|edit|sync)\b"
+                       r"|\b(?:gh|hub)" + _FLAGS + r"\s+ruleset\b|" + _REPO + r"(?:rulesets\b|branches/[^\s'\"]+/protection\b)"
+                       r"|(?:api\.github\.com\.?/|(?<![\w/.-])/?)orgs/[^/\s'\"]+/rulesets\b", re.IGNORECASE)
 _RAW_GITHUB = re.compile(r"api\.github\.com", re.IGNORECASE)
 _GH_API = re.compile(r"\b(?:gh|hub)\b.*\bapi\b", re.IGNORECASE | re.DOTALL)
-_GITHUB_WRITE_PATH = re.compile(r"/contents/|/git/(?:refs|commits|trees|blobs|tags)\b|/hooks\b"
-                                r"|/actions/(?:secrets|variables|permissions)\b|/environments/")
+_GITHUB_WRITE_PATH = re.compile(_REPO + r"(?:contents/|git/(?:refs|commits|trees|blobs|tags)\b|hooks\b"
+                                r"|actions/(?:secrets|variables|permissions)\b|environments/)", re.IGNORECASE)
 _WRITE = re.compile(r"(?<![\w-])(?:-X|-d|-T|--method|--request|--data[\w-]*|--field|--raw-field|--input"
                     r"|--upload-file|--json|--form[\w-]*|--post-data|--post-file|--body-data|--body-file)"
                     r"|(?<![\w-])-[fF](?=\s|\w+=)|\b(?:POST|PUT|PATCH|DELETE)\b")
+_GH_FIELD = re.compile(r"(?<![\w-])-[fF]\S")  # attached gh fields: -f'ref=x', -Fsha=y
+_GH_GET = re.compile(r"(?:-X|--method)[\s=]*['\"]?GET\b")
+
+
+def _gh_writes(text: str) -> bool:
+    """gh api sends a write unless the method is GET (fields then become query parameters)."""
+    if _GH_GET.search(text) and not re.search(r"\b(?:POST|PUT|PATCH|DELETE)\b|--input\b", text):
+        return False
+    return bool(_WRITE.search(text) or _GH_FIELD.search(text))
 
 
 def check_github(command: str) -> str | None:
@@ -216,8 +229,7 @@ def check_github(command: str) -> str | None:
     if _SETTINGS.search(text):
         return RULES_HINT
     # gh/hub api: writes only. Any other client: every method (curl -T, HTTPie fields and others imply writes).
-    if _GITHUB_WRITE_PATH.search(text) and (
-            _RAW_GITHUB.search(text) or (_GH_API.search(text) and _WRITE.search(text))):
+    if _GITHUB_WRITE_PATH.search(text) and (_RAW_GITHUB.search(text) or (_GH_API.search(text) and _gh_writes(text))):
         return API_HINT
     return None
 
@@ -227,39 +239,65 @@ def check_github(command: str) -> str | None:
 
 _REMOTE_HOST = re.compile(r"\.supabase\.co\b|pooler\.supabase\.com|\.rds\.amazonaws\.com|\.neon\.tech|\.render\.com"
                           r"|\.railway\.app|\.aivencloud\.com|\.cockroachlabs\.cloud", re.IGNORECASE)
-_PG_CLIENT = re.compile(r"(?<![\w.-])(?:psql|pg_dump|pg_dumpall|pg_restore|pgcli|usql)(?![\w-])")
-_PG_HOST = re.compile(r"postgres(?:ql)?://(?:[^@/\s'\"]*@)?([^/?\s'\"]*)|(?:host|hostaddr)\s*=\s*['\"]?([^\s'\";&]*)"
+# A tool in command position: after a separator, `$(`, a shell keyword, wrappers, VAR=value and package runners.
+# Not after `(`, a backtick or a quote, so `feat(supabase):` and `run \`psql\`` in a message are text.
+_WRAP = (r"(?:time|nohup|nice|watch|sudo|env|exec|command|xargs|timeout|npx|bunx|uvx"
+         r"|npm\s+exec|pnpm(?:\s+(?:exec|dlx))?|yarn(?:\s+dlx)?|bun\s+x)(?![\w-])")
+# a flag value is never a number, an assignment or a wrapper, so each word parses one way (no backtracking blowup)
+_START = (r"(?:^|[;&|\n]|\$\(|\b(?:then|do|else|if|while|until)\s|\b(?:bash|sh|zsh|dash|ksh)\s+-\w*c\s+['\"]?)\s*"
+          r"(?:(?:[A-Za-z_]\w*=\S*|" + _WRAP + r"(?:\s+-\S+(?:\s+(?!\d|[A-Za-z_]\w*=|" + _WRAP
+          + r")[^-\s]\S*)?|\s+\d\S*)*)\s+)*\$?(?:\S*/)?")
+_SUPABASE_NAME = r"(supabase)(?![\w/-])"
+_PG_NAME = r"(psql|pg_dump|pg_dumpall|pg_restore|pgcli|usql)(?![\w-])"
+# Piped into a shell, eval'd or fed through xargs: the tool's words can come from anywhere, so match the whole text.
+_SHELL_FED = re.compile(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|ksh)\b|\beval\b|\bsource\b|\bxargs\b|<\(")
+_SUPABASE_REMOTE = re.compile(r"--linked\b|--db-url\b|--project-ref\b|[$`]"
+                              r"|\b(?:dump|pull|push|link|repair|fetch|inspect)\b")
+_PG_HOST = re.compile(r"postgres(?:ql)?://(?:[^@/\s'\"]*@)?([^/?\s'\"]*)|(?:host|hostaddr)=['\"]?([^\s'\";&]*)"
                       r"|(?<![\w-])(?:-h|--host)(?:\s+|=)?['\"]?([^\s'\"]*)")
 _LOCAL = re.compile(r"|/.*|%2f.*|(?:localhost|127\.0\.0\.1|::1|\[::1\])(?::\d+)?", re.IGNORECASE)
-_DB_ENV = re.compile(r"\b(PGHOST|PGHOSTADDR|PGSERVICE|DATABASE_URL|SUPABASE_DB_URL|POSTGRES_URL)=['\"]?([^\s'\"]*)")
+_DB_ENV = re.compile(r"\b(PGHOST|PGHOSTADDR|PGSERVICE|DATABASE_URL|SUPABASE_DB_URL|POSTGRES_URL)="
+                     r"(?:'([^']*)'|\"([^\"]*)\"|([^\s'\"]*))")
 _LOCAL_VALUE = re.compile(r"|/.*|(?:sqlite3?|file):.*|::1"
                           r"|(?:[\w+]+://(?:[^@/\s]*@)?)?(?:localhost|127(?:\.\d+){3}|\[::1\])(?:[:/?].*)?",
                           re.IGNORECASE)
-# supabase as a command (node_modules/.bin/supabase too), not a path or package (supabase/migrations, @supabase/ssr)
-_SUPABASE = re.compile(r"(?<![\w.@-])supabase(?![\w/-])")
-_SUPABASE_REMOTE = re.compile(r"--linked\b|--db-url\b|--project-ref\b|[$`]"
-                              r"|\b(?:dump|pull|push|link|repair|fetch|inspect)\b")
+
+
+def _local_value(value: str) -> bool:
+    if "://" not in value and "=" in value:  # libpq keywords: host=127.0.0.1 dbname=test
+        return all(_LOCAL.fullmatch(h) for h in re.findall(r"\b(?:host|hostaddr)\s*=\s*([^\s]*)", value))
+    return bool(_LOCAL_VALUE.fullmatch(value))
+
+
+def _segments(name: str, command: str) -> list[str]:
+    """Each invocation of the tool, from its name to the next separator (the whole text when shell-fed)."""
+    if _SHELL_FED.search(command):
+        return [command] if re.search(r"(?<![\w.@-])" + name, command) else []
+    return [m.group(1) + re.match(r"[^;&|\n]*", command[m.end():]).group(0)
+            for m in re.finditer(_START + name, command)]
 
 
 def check_db(command: str) -> str | None:
     if _REMOTE_HOST.search(command):  # whatever the tool: psql, python -c, node -e, an env var
         return DB_HINT
-    for name, value in _DB_ENV.findall(command):
-        if name == "PGSERVICE" or "$" in value or not _LOCAL_VALUE.fullmatch(value):
+    for name, *values in _DB_ENV.findall(command):
+        value = "".join(values)
+        if name == "PGSERVICE" or "$" in value or not _local_value(value):
             return f"`{name}` must name a local database here. {DB_HINT}"
-    if _SUPABASE.search(command) and _SUPABASE_REMOTE.search(command):  # --local does not exempt
-        return DB_HINT
+    plain = re.sub(r"[\\'\"]", "", command)  # "supabase", s\upabase and $'supabase' spell supabase
+    if any(_SUPABASE_REMOTE.search(seg) for text in (command, plain) for seg in _segments(_SUPABASE_NAME, text)):
+        return DB_HINT  # --local does not exempt
     if re.search(r"api\.supabase\.com", command, re.IGNORECASE) and (
             re.search(r"/database/(?:query|migrations)", command) or _WRITE.search(command)):
         return DB_HINT
-    if _PG_CLIENT.search(command):
-        if re.search(r"[$`]|\bservice\s*=", command):
+    for seg in (s for text in (command, plain) for s in _segments(_PG_NAME, text)):
+        if re.search(r"[$`]|\bservice=", seg):
             return f"A database target held in a variable or pg_service entry can't be checked. {DB_HINT}"
-        hosts = ["".join(g or "" for g in m.groups()) for m in _PG_HOST.finditer(command)]
-        if not hosts:
-            if os.environ.get("PGSERVICE"):
-                return f"PGSERVICE is set. {DB_HINT}"
-            hosts = [os.environ.get("PGHOST", ""), os.environ.get("PGHOSTADDR", "")]
+        if os.environ.get("PGSERVICE"):
+            return f"PGSERVICE is set. {DB_HINT}"
+        hosts = ["".join(g or "" for g in m.groups()) for m in _PG_HOST.finditer(seg)] or [""]
+        env = [os.environ.get("PGHOST", ""), os.environ.get("PGHOSTADDR", "")]
+        hosts = [h for host in hosts for h in ([host] if host else env)]  # an empty host means libpq's PGHOST
         if not all(_LOCAL.fullmatch(h.strip()) for host in hosts for h in host.split(",")):
             return f"Connections to a remote database are not made from cloud sessions. {DB_HINT}"
     return None
