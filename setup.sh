@@ -23,32 +23,38 @@ BIN="${CLOUD_KIT_BIN:-/usr/local/bin}"
 REQUIRED="setup.sh bin/land bin/cloud-prep hooks/guard.py lib/kitpolicy.py claude/CLAUDE.md claude/settings.json policy/client-repos.txt"
 log() { echo "[cloud-kit] $*" >&2; }
 
-TOKEN="$$.$(date +%s).$RANDOM"
 LOCKED=0
 STAGE=""
 
-# One installer at a time. The lock covers fetch, verify, swap and config only (well under a
-# minute), so a lock older than 5 minutes belongs to a dead installer and is stale. The owner
-# token keeps an installer from removing a lock that another one has taken over.
+# One installer at a time: an flock on fd 9, which this shell keeps open. The kernel drops it
+# when the holder exits, so a dead installer never leaves a stale lock and nothing has to
+# guess. Python takes the lock (macOS has no flock binary); it belongs to the open file, so
+# it stays with this shell after Python exits.
 lock() {
-  local i
-  for i in $(seq 1 "${CLOUD_KIT_LOCK_WAIT:-30}"); do
-    if mkdir "$KIT.lock" 2>/dev/null; then
-      echo "$TOKEN" >"$KIT.lock/owner" && LOCKED=1 && return 0
-      rm -rf "$KIT.lock"; return 1
-    fi
-    if [ -n "$(find "$KIT.lock" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
-      rm -rf "$KIT.lock"
-      continue
-    fi
-    sleep 1
-  done
+  mkdir -p "$(dirname "$KIT")" && exec 9>>"$KIT.flock" || return 1
+  if python3 - "${CLOUD_KIT_LOCK_WAIT:-30}" <<'PY'
+import fcntl, sys, time
+deadline = time.monotonic() + float(sys.argv[1])
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.2)
+PY
+  then
+    LOCKED=1
+    return 0
+  fi
+  exec 9>&-
   return 1
 }
 unlock() {
   [ "$LOCKED" = 1 ] || return 0
   LOCKED=0
-  [ "$(cat "$KIT.lock/owner" 2>/dev/null)" = "$TOKEN" ] && rm -rf "$KIT.lock"
+  exec 9>&-
 }
 
 restore_kit() {  # an installer killed between the two moves leaves only $KIT.old
@@ -125,8 +131,28 @@ try:
 except PolicyError as e:
     sys.exit(f"policy: {e}")
 PY
-  echo '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/"}' \
-    | CLAUDE_CODE_REMOTE=true python3 -I "$dir/hooks/guard.py" >/dev/null || return 1
+  # The guard must allow a plain command and deny a push to main.
+  python3 -I - "$dir/hooks/guard.py" <<'PY' || return 1
+import json, os, subprocess, sys
+env = dict(os.environ, CLAUDE_CODE_REMOTE="true")
+
+def denied(command):
+    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"})
+    proc = subprocess.run([sys.executable, "-I", sys.argv[1]], input=event, capture_output=True,
+                          text=True, env=env, timeout=20)
+    if proc.returncode != 0:
+        sys.exit(f"guard exited {proc.returncode} on {command!r}")
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except ValueError:
+        sys.exit(f"guard printed something that is not JSON on {command!r}")
+    return (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+
+if denied("ls"):
+    sys.exit("guard denies ls")
+if not denied("git push origin main"):
+    sys.exit("guard allows git push origin main")
+PY
 }
 
 install_kit() {  # the caller holds the lock
@@ -146,7 +172,8 @@ install_kit() {  # the caller holds the lock
   if [ -d "$KIT" ] && ! mv "$KIT" "$KIT.old"; then
     log "cannot move the current kit aside"; rm -rf "$STAGE"; STAGE=""; return 1
   fi
-  if ! mv "$STAGE" "$KIT"; then
+  # mv into an existing directory would nest the kit inside it (macOS mv has no -T).
+  if [ -e "$KIT" ] || ! mv "$STAGE" "$KIT"; then
     log "cannot install the new kit; restoring the current one"
     restore_kit
     rm -rf "$STAGE"; STAGE=""; return 1

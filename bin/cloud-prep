@@ -314,19 +314,21 @@ def _arch() -> str:
 
 
 def _stream(url: str, deadline: float, sink) -> None:
-    """Pass `url`'s body to `sink` in small reads. Before each read the socket timeout is cut
-    to the time left, so a server that trickles bytes cannot hold us past `deadline`."""
-    with urllib.request.urlopen(url, timeout=min(20, _left(deadline))) as r:
-        sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
-        read = getattr(r, "read1", r.read)  # read1: at most one socket read per call
-        while True:
-            left = min(20, _left(deadline))
-            if sock is not None:
-                sock.settimeout(left)
-            chunk = read(64 * 1024)
-            if not chunk:
-                return
-            sink(chunk)
+    """Pass `url`'s body to `sink`. A timer signal ends the whole request, headers included,
+    at `deadline`, so a server that trickles bytes cannot hold us past it (socket timeouts
+    only measure silence). cloud-prep runs no threads, so the signal reaches this code."""
+    def expired(*_):
+        raise TimeoutError(f"ran out of the time budget downloading {url}")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, _left(deadline))
+    try:
+        with urllib.request.urlopen(url, timeout=min(20, _left(deadline))) as r:
+            while chunk := r.read(64 * 1024):
+                sink(chunk)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _fetch(url: str, deadline: float) -> bytes:
@@ -555,11 +557,28 @@ def _run_plan(repo: Path, plan: Plan, node_major: int | None, env: dict[str, str
     return f"ok {manager} ({secs}s)"
 
 
-def _write_request(sd: Path, node_major: int | None, node_bin: Path | None) -> None:
-    """The inputs the latest prep asked for; a running install re-reads them when it finishes."""
-    tmp = sd / "request.json.tmp"
-    tmp.write_text(json.dumps({"node": node_major, "node_bin": str(node_bin) if node_bin else None}))
-    os.replace(tmp, sd / "request.json")
+def _write_request(repo: Path, sd: Path, node_major: int | None, node_bin: Path | None) -> None:
+    """The inputs the latest prep asked for, and the repo's Node pin then; a running install
+    re-reads them when it finishes. Each writer has its own temp file."""
+    request = {"node": node_major, "node_bin": str(node_bin) if node_bin else None, "pin": node_spec(repo)[0]}
+    fd, tmp = tempfile.mkstemp(dir=sd, prefix=".request-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(request))
+        os.replace(tmp, sd / "request.json")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _pin_changed(repo: Path, sd: Path) -> bool:
+    """The repo's Node pin differs from the one the latest prep saw."""
+    try:
+        data = json.loads(_read(sd / "request.json") or "")
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "pin" in data and data["pin"] != node_spec(repo)[0]
 
 
 def _read_request(sd: Path, default: tuple[int | None, Path | None]) -> tuple[int | None, Path | None]:
@@ -575,14 +594,12 @@ def _inputs_key(repo: Path, node_major: int | None, node_bin: Path | None) -> tu
     return node_major, str(node_bin), tuple(_plan_stamp(repo, p, node_major) for p in install_plans(repo))
 
 
-def _install_round(repo: Path, node_major: int | None, node_bin: Path | None, sd: Path) -> int:
-    """Corepack, then every install plan; the caller holds the repo's lock.
-    Always leaves a final status, failures first."""
+def _install_round(repo: Path, node_major: int | None, node_bin: Path | None, sd: Path) -> tuple[int, str]:
+    """Corepack, then every install plan; the caller holds the repo's lock and writes the
+    returned status. Returns (exit code, final status line), failures first."""
     plans = install_plans(repo)
     if all(plan_current(repo, p, node_major, sd) for p in plans):
-        parts = [f"ok {p[0]} (unchanged)" for p in plans] or ["none"]
-        (sd / "status").write_text("; ".join(parts) + "\n")
-        return 0
+        return 0, "; ".join(f"ok {p[0]} (unchanged)" for p in plans) or "none"
     parts = []
     with open(sd / "log", "w") as log:  # opened only once there is something to install
         try:
@@ -599,8 +616,7 @@ def _install_round(repo: Path, node_major: int | None, node_bin: Path | None, sd
             log.write(f"cloud-prep error: {e}\n")
             parts.append(f"failed (cloud-prep error: {e}) — log: {sd / 'log'}")
     parts.sort(key=lambda p: not p.startswith("failed"))
-    (sd / "status").write_text("; ".join(parts) + "\n")
-    return 1 if parts[0].startswith("failed") else 0
+    return (1 if parts[0].startswith("failed") else 0), "; ".join(parts)
 
 
 def run_install(repo: Path, node_major: int | None, node_bin: Path | None) -> int:
@@ -610,15 +626,18 @@ def run_install(repo: Path, node_major: int | None, node_bin: Path | None) -> in
     releasing the lock, so no request is missed."""
     sd = state_dir(repo)
     default = (node_major, node_bin)
-    done, rc = None, 0
-    for _ in range(5):  # inputs that keep changing still end in a final status
-        if done is not None and _inputs_key(repo, *_read_request(sd, default)) == done:
-            break
+    rc = 0
+    for attempt in range(5):  # inputs that keep changing still end in a final status
         with open(sd / "lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             request = _read_request(sd, default)
             done = _inputs_key(repo, *request)
-            rc = _install_round(repo, *request, sd)
+            rc, status = _install_round(repo, *request, sd)
+            if attempt < 4 and _inputs_key(repo, *_read_request(sd, default)) != done:
+                status = "running (the inputs changed; installing again)"  # never a final status between rounds
+            (sd / "status").write_text(status + "\n")
+        if _inputs_key(repo, *_read_request(sd, default)) == done:
+            break
     return rc
 
 
@@ -639,8 +658,11 @@ def start_background_install(repo: Path, node_major: int | None, node_bin: Path 
         return "no lockfile at the repo root; nothing to install"
     sd = state_dir(repo)
     cmds = ", ".join(" ".join(p[1]) for p in plans)
-    _write_request(sd, node_major, node_bin)  # before the running check; see run_install
+    _write_request(repo, sd, node_major, node_bin)  # before the running check; see run_install
     if all(plan_current(repo, p, node_major, sd) for p in plans):
+        if not (_read(sd / "status") or "").startswith("ok") and not _install_running(sd):
+            # a failed or interrupted install for other inputs left its status behind
+            (sd / "status").write_text("; ".join(f"ok {p[0]} (unchanged)" for p in plans) + "\n")
         return f"up to date ({', '.join(p[0] for p in plans)}: lockfiles and Node unchanged)"
     if _install_running(sd):
         return (f"an install is already running ({cmds}); it installs again if these inputs changed. "
@@ -662,7 +684,7 @@ def _settled(repo: Path, sd: Path, status: str) -> str:
     if status.startswith("failed") or not plans:
         return status
     node_major, _ = _read_request(sd, (None, None))
-    if not all(plan_current(repo, p, node_major, sd) for p in plans):
+    if _pin_changed(repo, sd) or not all(plan_current(repo, p, node_major, sd) for p in plans):
         return (f"stale: the lockfiles or Node changed after this install ({status}); "
                 "run `cloud-prep` to install again")
     return status if status != "none" else "ok (" + ", ".join(f"{p[0]} unchanged" for p in plans) + ")"
@@ -674,7 +696,10 @@ def wait_status(repo: Path, timeout: float) -> str:
     while True:
         status = _read(sd / "status") or "none\n"
         if not status.startswith("running"):
-            return _settled(repo, sd, status.strip())
+            settled = _settled(repo, sd, status.strip())
+            if not (settled.startswith("stale") and _install_running(sd)):
+                return settled
+            status = "running (an install for the newer inputs is under way)\n"
         try:
             stale = time.time() - (sd / "status").stat().st_mtime > 15
         except OSError:
@@ -703,8 +728,9 @@ def land_policy(name: str | None) -> str:
         return "no GitHub origin; `land` does not apply"
     may_merge, why = policy_for(name, KIT_DIR)
     if may_merge:
-        # by name only; `land` checks the repository id too before it merges
-        return f"{name}: `land` merges after green CI"
+        # by name only: the repository id is not known here
+        return (f"{name}: owner allowlisted; `land` decides at merge time (it also checks the client list "
+                f"by repository id) and merges after green CI")
     return f"{name}: `land` opens the PR and stops for review ({why})"
 
 

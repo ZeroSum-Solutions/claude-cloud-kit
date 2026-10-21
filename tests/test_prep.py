@@ -342,10 +342,90 @@ def test_wait_reports_a_stale_result(tmp_path, state, monkeypatch):
     repo.mkdir()
     (repo / "package-lock.json").write_text("{}")
     assert prep.run_install(repo, 24, None) == 0
-    prep._write_request(prep.state_dir(repo), 24, None)
+    prep._write_request(repo, prep.state_dir(repo), 24, None)
     assert prep.wait_status(repo, 1).startswith("ok npm (")
     (repo / "package-lock.json").write_text('{"changed": true}')
     assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
+
+
+def test_wait_reports_a_changed_node_pin_as_stale(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    prep._write_request(repo, prep.state_dir(repo), 24, None)
+    assert prep.run_install(repo, 24, None) == 0
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+    (repo / ".nvmrc").write_text("26\n")  # no prep ran since
+    assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
+
+
+def test_concurrent_requests_do_not_share_a_temp_file(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sd = prep.state_dir(repo)
+    real = os.replace
+    nested = []
+
+    def replace(src, dst):
+        if not nested:  # another prep writes its request in between
+            nested.append(1)
+            prep._write_request(repo, sd, 26, None)
+        real(src, dst)
+
+    monkeypatch.setattr(prep.os, "replace", replace)
+    prep._write_request(repo, sd, 24, None)
+    assert prep._read_request(sd, (None, None))[0] == 24
+    assert sorted(f.name for f in sd.iterdir()) == ["request.json"]
+
+
+def test_wait_never_sees_a_final_status_between_install_rounds(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    sd = prep.state_dir(repo)
+    bin_dir = tmp_path / "fakebin"
+    _exe(bin_dir / "npm", f'''mkdir -p node_modules; echo "$@" >> npm.calls
+[ -f once ] || {{ touch once; echo '{{"node": 26, "node_bin": null}}' > "{sd}/request.json"; }}''')
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    seen = []
+    real_round = prep._install_round
+
+    def install_round(*a):
+        seen.append(prep._read(sd / "status") or "")
+        return real_round(*a)
+
+    monkeypatch.setattr(prep, "_install_round", install_round)
+    assert prep.run_install(repo, 24, None) == 0
+    assert len(seen) == 2 and seen[1].startswith("running")
+    assert (sd / "status").read_text().startswith("ok npm (")
+
+
+def test_wait_keeps_waiting_while_a_newer_install_runs(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 26, None)  # a newer request, its install running
+    with open(sd / "lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert prep.wait_status(repo, 1).startswith("running")
+    assert prep.wait_status(repo, 1).startswith("stale")
+
+
+def test_up_to_date_replaces_an_old_failed_status(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    sd = prep.state_dir(repo)
+    (sd / "status").write_text("failed npm ci (exit 1, 3s) — log: x\n")  # from another branch
+    assert prep.start_background_install(repo, 24, None).startswith("up to date")
+    assert prep.wait_status(repo, 1).startswith("ok npm")
 
 
 def test_wait_reports_a_dead_install(tmp_path, state):
@@ -448,6 +528,18 @@ class _Trickle(_Response):
         return b"x"
 
     read = read1
+
+
+def test_trickling_headers_stop_at_the_deadline(monkeypatch):
+    def urlopen(url, timeout=None):  # headers that arrive a line every 50 ms, forever
+        while True:
+            time.sleep(0.05)
+
+    monkeypatch.setattr(prep.urllib.request, "urlopen", urlopen)
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        prep._fetch("https://example.invalid/x", time.monotonic() + 0.5)
+    assert time.monotonic() - start < 2
 
 
 @pytest.mark.parametrize("call", ["fetch", "download"])
@@ -602,6 +694,6 @@ def test_only_the_primary_repo_sets_path(tmp_path, state, monkeypatch):
 
 
 def test_land_policy_lines():
-    assert "merges after green CI" in prep.land_policy("wiggdevin/zs-land-sandbox")
+    assert "decides at merge time" in prep.land_policy("wiggdevin/zs-land-sandbox")
     assert "stops for review" in prep.land_policy("wiggdevin/client-example")
     assert "not in the auto-merge allowlist" in prep.land_policy("someone/else")

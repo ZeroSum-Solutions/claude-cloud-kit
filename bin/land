@@ -19,7 +19,9 @@ deletion. This script keeps zs-land's safety rules with `gh api` REST calls only
 - CI gate: every non-advisory check run and commit status must pass or be skipped, with at
   least one real pass. Pending waits; failure, cancelled, neutral, timed out or action
   required blocks. No passing check after LAND_NO_CI_GRACE seconds fails closed. A pass is
-  trusted only LAND_PR_SETTLE seconds after this run's push, so workflows can register.
+  trusted only LAND_PR_SETTLE seconds after this run's push and PR read, so workflows can
+  register. Re-runs replace an attempt only when they started after it completed; runs
+  with one name that overlapped (matrix legs) are all judged.
   Then GitHub's own roll-up must agree, always: mergeable true and mergeable_state "clean"
   or "has_hooks". It also covers commit statuses the cloud GitHub app cannot read and
   matrix legs that share a name. "unstable" or "blocked" waits LAND_BLOCKED_WAIT seconds,
@@ -33,7 +35,7 @@ deletion. This script keeps zs-land's safety rules with `gh api` REST calls only
 
 Exit: 0 landed, or PR opened and stopped by policy or --pr
       1 nothing merged (precondition, CI, conflict, or GitHub refused the merge with
-        HTTP 405/409/422) — PR left open
+        HTTP 405/409/422 and then reported the PR unmerged) — PR left open
       3 PR MERGED, or the merge result is unknown (any other merge-call failure, and
         GitHub did not report the PR merged within LAND_MERGE_CONFIRM seconds), or the
         follow-up is incomplete — check the PR by hand, do not re-run
@@ -44,6 +46,7 @@ Usage: land [--pr] [--dry-run] [--title TITLE] [--body-file FILE]
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -51,6 +54,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -242,15 +246,31 @@ def judge(check_runs: list[dict], statuses: list[dict], advisory: set[str]) -> V
     return Verdict(state, passed, pending, failed, skipped, adv, adv_open)
 
 
+def _when(stamp) -> datetime | None:
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")) if isinstance(stamp, str) else None
+    except ValueError:
+        return None
+
+
 def latest_runs(check_runs: list[dict]) -> list[dict]:
-    """The newest attempt of each check per check suite. `filter=latest` would also merge
-    same-named jobs from different workflows, hiding a failure behind a later pass."""
-    newest: dict[tuple, dict] = {}
+    """Drop a check run only when a re-run replaced it: a newer run with the same check suite,
+    app and name that started after it completed. Runs that overlapped (matrix legs that share
+    a name) or that lack times all stay, so a failed or neutral leg is never hidden behind a
+    pass. `filter=latest` would also merge same-named jobs from different workflows."""
+    groups: dict[tuple, list[dict]] = {}
     for run in check_runs:
         key = ((run.get("check_suite") or {}).get("id"), (run.get("app") or {}).get("id"), run.get("name"))
-        if key not in newest or (run.get("id") or 0) > (newest[key].get("id") or 0):
-            newest[key] = run
-    return list(newest.values())
+        groups.setdefault(key, []).append(run)
+
+    def replaced(old: dict, group: list[dict]) -> bool:
+        done = _when(old.get("completed_at"))
+        return done is not None and any(
+            (new.get("id") or 0) > (old.get("id") or 0)
+            and (started := _when(new.get("started_at"))) is not None and started >= done
+            for new in group)
+
+    return [run for group in groups.values() for run in group if not replaced(run, group)]
 
 
 def strip_proxy_footer(body: str | None) -> str:
@@ -433,10 +453,11 @@ def held_message(number: int, rollup: str, verdict: Verdict, url: str) -> str:
                + (", or a required review is missing" if rollup == "blocked" else ""))
     seen = ", ".join(verdict.advisory_open) or "none that land can see"
     return (f"✗ every gating check run passed, but PR #{number} still cannot merge after {int(BLOCKED_WAIT)}s — "
-            f"{why}. Not passing: {seen}. If it is advisory, merge by hand on GitHub. PR left open: {url}")
+            f"{why}. Not passing: {seen}. If it is advisory, merge by hand on GitHub; otherwise run land again "
+            f"to keep waiting. PR left open: {url}")
 
 
-def wait_for_ci(repo: Repo, number: int, sha: str, url: str, advisory: set[str], pushed_at: float) -> Verdict:
+def wait_for_ci(repo: Repo, number: int, sha: str, url: str, advisory: set[str], settle_from: float) -> Verdict:
     start = time.monotonic()
     last = None
     settled = False
@@ -449,13 +470,13 @@ def wait_for_ci(repo: Repo, number: int, sha: str, url: str, advisory: set[str],
             raise Stop(f"✗ CI failed: {', '.join(verdict.failed)} — PR left open: {url}")
         if verdict.state == "pass" and rollup == "ok":
             held_since = None
-            if settled and now - pushed_at >= PR_SETTLE:
+            if settled and now - settle_from >= PR_SETTLE:
                 return verdict
             # A workflow can register its checks after the first one finishes, and workflows
             # register a little after a push. Read again after a pause, and never sooner than
-            # PR_SETTLE after this run's push.
+            # PR_SETTLE after this run's push and PR read.
             settled = True
-            time.sleep(max(SETTLE, pushed_at + PR_SETTLE - now))
+            time.sleep(max(SETTLE, settle_from + PR_SETTLE - now))
             continue
         settled = False
         if verdict.state == "pass":  # the runs passed; GitHub's roll-up has not
@@ -484,8 +505,10 @@ def wait_for_ci(repo: Repo, number: int, sha: str, url: str, advisory: set[str],
 
 
 def recheck(repo: Repo, number: int, sha: str, url: str, advisory: set[str]) -> dict:
-    """Everything the merge depends on, read again right before it. The PR is read last and
-    every PR condition is judged on that one object; nothing waits between it and the merge."""
+    """Everything the merge depends on, read again right before it. First wait until GitHub
+    has computed mergeability; then read the default branch, CI and HEAD; then read the PR
+    once more, without waiting, and judge every PR condition on that last read."""
+    read_pr(repo, number)
     current_default = gh_api(f"repos/{repo.nwo}").get("default_branch")
     if current_default != repo.default:
         raise Stop(f"✗ the default branch changed to {current_default} during the CI wait — "
@@ -497,7 +520,7 @@ def recheck(repo: Repo, number: int, sha: str, url: str, advisory: set[str]) -> 
                    f" — merge aborted, PR left open; run land again: {url}")
     if git("rev-parse", "HEAD") != sha:
         raise Stop(f"✗ branch head changed during the CI wait — merge aborted, PR left open: {url}")
-    live = read_pr(repo, number)
+    live = gh_api(f"repos/{repo.nwo}/pulls/{number}")
     rollup = pr_gate(repo, live, number, sha, url)
     if rollup != "ok":
         raise Stop(f"✗ GitHub reports PR #{number} as {rollup} right before the merge — merge aborted, "
@@ -505,7 +528,7 @@ def recheck(repo: Repo, number: int, sha: str, url: str, advisory: set[str]) -> 
     return live
 
 
-REFUSED = {405, 409, 422}  # GitHub answered and did not merge
+REFUSED = {405, 409, 422}  # GitHub answered and did not merge this call (405 also: already merged)
 
 
 def merge(repo: Repo, pr: dict, sha: str, subjects: list[str]) -> str:
@@ -521,7 +544,7 @@ def merge(repo: Repo, pr: dict, sha: str, subjects: list[str]) -> str:
     except GhError as e:
         if e.status in REFUSED:
             hint = " (this repo uses a merge queue; enqueue it on GitHub)" if "merge queue" in e.message.lower() else ""
-            raise Stop(f"✗ GitHub refused the merge: {e.message}{hint} — PR left open: {url}")
+            return confirm_merge(repo, number, sha, url, f"GitHub refused the merge: {e.message}{hint}", refused=True)
         return confirm_merge(repo, number, sha, url, f"the merge call failed ({e.message})")
     except Exception as e:  # noqa: BLE001 — a dropped or garbled answer can hide a merge
         return confirm_merge(repo, number, sha, url, f"the merge call failed ({e or type(e).__name__})")
@@ -531,19 +554,22 @@ def merge(repo: Repo, pr: dict, sha: str, subjects: list[str]) -> str:
     return result.get("sha", "")
 
 
-def confirm_merge(repo: Repo, number: int, sha: str, url: str, why: str) -> str:
-    """The merge call gave no clear answer. GitHub may have merged anyway: ask for a while."""
+def confirm_merge(repo: Repo, number: int, sha: str, url: str, why: str, refused: bool = False) -> str:
+    """The merge call gave no clear answer, or a refusal (the PR may already be merged). Ask
+    GitHub for a while. refused: a successful read of an unmerged PR means nothing merged."""
     deadline = time.monotonic() + MERGE_CONFIRM
     while True:
         try:
             after = gh_api(f"repos/{repo.nwo}/pulls/{number}")
         except Exception:  # noqa: BLE001 — keep asking until the deadline
-            after = {}
+            after = None
         if isinstance(after, dict) and after.get("merged"):
             head = (after.get("head") or {}).get("sha") or "?"
             if head != sha:
                 raise Stop(f"✗ PR #{number} MERGED at {head[:7]}, not {sha[:7]} — check {url}; do NOT re-run land", 3)
             return after.get("merge_commit_sha") or ""
+        if refused and isinstance(after, dict) and after.get("merged") is False:
+            raise Stop(f"✗ {why} — PR left open: {url}")
         if time.monotonic() >= deadline:
             raise Stop(f"✗ {why}; merge result unknown after {int(MERGE_CONFIRM)}s — check the PR by hand "
                        f"before doing anything; do NOT re-run land: {url}", 3)
@@ -588,6 +614,10 @@ def after_merge(repo: Repo, pr: dict, branch: str, sha: str, merge_sha: str) -> 
     merge_sha = merged.get("merge_commit_sha") or merge_sha
     if not merged.get("merged") or not merge_sha:
         return [f"GitHub does not report PR #{number} as merged"], ""
+    head = (merged.get("head") or {}).get("sha")
+    if head != sha:  # never delete a branch for a merge of some other commit
+        return [f"GitHub reports the merged head as {(head or '?')[:7]}, not the pushed {sha[:7]}; "
+                f"branches left as they are"], ""
 
     # land may run from a subdirectory the default branch does not have.
     os.chdir(git("rev-parse", "--show-toplevel"))
@@ -612,11 +642,21 @@ def after_merge(repo: Repo, pr: dict, branch: str, sha: str, merge_sha: str) -> 
             return [f"local {repo.default} could not fast-forward to origin/{repo.default}"], where
     else:
         # git refuses to check out a branch that another worktree has checked out.
-        git("switch", "-q", "--detach", f"origin/{repo.default}")
+        if not git_ok("switch", "-q", "--detach", f"origin/{repo.default}"):
+            return [f"could not leave {branch} (switch to {repo.default} and to origin/{repo.default} "
+                    f"both failed); local branch kept"], branch
         where = f"a detached HEAD at origin/{repo.default} ({repo.default} is checked out in another worktree)"
     if not git_ok("update-ref", "-d", f"refs/heads/{branch}", sha):
         return [f"local branch {branch} moved after the merge; left as it is"], where
     return [], where
+
+
+def merge_allowed(repo: Repo, origin_nwo: str) -> tuple[bool, str]:
+    """The landing policy. A kitpolicy that cannot check repository ids comes from a refresh
+    that mixed kit versions; it never allows a merge (the next session start repairs it)."""
+    if "repo_id" not in inspect.signature(policy_for).parameters:
+        return False, "the installed kit mixes versions (its policy cannot check repository ids); start a new session"
+    return policy_for(repo.nwo, KIT_DIR, aliases=(origin_nwo,), repo_id=repo.id)
 
 
 # ---------------------------------------------------------------- main
@@ -639,7 +679,7 @@ def main(argv: list[str]) -> int:
     repo = resolve_repo()
     branch, subjects = preflight(repo)
     origin_nwo = parse_nwo(git("remote", "get-url", "origin", check=False)) or repo.nwo
-    may_merge, why = policy_for(repo.nwo, KIT_DIR, aliases=(origin_nwo,), repo_id=repo.id)
+    may_merge, why = merge_allowed(repo, origin_nwo)
     advisory = split_list(os.environ.get("LAND_ADVISORY_CHECKS")
                           or git("config", "--get", "zs-land.advisoryChecks", check=False))
 
@@ -661,9 +701,8 @@ def main(argv: list[str]) -> int:
         raise Stop(f"✗ push failed: {push.stderr.strip()}\n  If the remote branch moved, fetch and rebase "
                    f"(or push with --force-with-lease) before running land again.")
 
-    pushed_at = time.monotonic()  # CI is trusted only PR_SETTLE after this run's own push
-
     pr = find_or_open_pr(repo, branch, subjects, args.title, body)
+    settle_from = time.monotonic()  # CI is trusted only PR_SETTLE after this run's push and PR
     url = pr["html_url"]
     if args.pr:
         say(f"✓ PR ready for review: {url}")
@@ -674,7 +713,7 @@ def main(argv: list[str]) -> int:
     if pr.get("draft"):
         raise Stop(f"✗ PR #{pr['number']} is a draft; mark it ready on GitHub (the cloud proxy cannot): {url}")
 
-    verdict = wait_for_ci(repo, pr["number"], sha, url, advisory, pushed_at)
+    verdict = wait_for_ci(repo, pr["number"], sha, url, advisory, settle_from)
     say(f"✓ CI green: {', '.join(verdict.passed)}"
         + (f" (advisory, not gating: {', '.join(verdict.advisory)})" if verdict.advisory else ""))
     live = recheck(repo, pr["number"], sha, url, advisory)

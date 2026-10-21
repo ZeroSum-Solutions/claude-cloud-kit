@@ -19,10 +19,10 @@ than adding a second one, so `claude --cloud` picks it without `/remote-env`.
 
 | Piece | What it does |
 |---|---|
-| `setup.sh` | Runs before Claude Code starts; the VM snapshot is cached ~7 days. Installs the kit into `/opt/claude-cloud-kit`, Node 24 and 26 (SHA-256 checked), `land` and `cloud-prep` on PATH, and `~/.claude/CLAUDE.md` plus `settings.json`. Every kit file is checked against `MANIFEST.sha256`, compiled and smoke-tested before it replaces the current kit. |
+| `setup.sh` | Runs before Claude Code starts; the VM snapshot is cached ~7 days. Installs the kit into `/opt/claude-cloud-kit`, Node 24 and 26 (SHA-256 checked), `land` and `cloud-prep` on PATH, and `~/.claude/CLAUDE.md` plus `settings.json`. Every kit file is checked against `MANIFEST.sha256`, compiled and smoke-tested (the guard must allow `ls` and deny a push to `main`) before it replaces the current kit. The installer lock is an `flock` the kernel releases when its holder dies. |
 | `cloud-prep` (SessionStart) | Refreshes the kit (60 s cap), picks the repo's Node version (`.nvmrc`, `.node-version`, `mise.toml`, `.mise.toml`, `.tool-versions`, `engines`; ranges and `lts/<name>` understood), installs dependencies in the background (pnpm, npm, yarn, bun, uv, poetry; frozen lockfiles; skipped when the lockfile is unchanged), and tells Claude the landing policy. Foreground work has a 180 s budget; if the pinned Node can't be installed in it, cloud-prep uses the newest Node in `/opt` (else the one on PATH) and puts it on the session PATH. Repos that use pnpm or yarn get their corepack shims before the session starts. `cloud-prep --wait` blocks until the install is done, and reports `stale` when the lockfiles or the Node pin changed after the last install (run `cloud-prep` to install again). |
 | `land` | REST-only landing (the cloud GitHub proxy blocks GraphQL, so `gh pr` and zs-land cannot run). Push → open or reuse the PR → wait for CI → squash-merge → switch to the synced default branch. |
-| `hooks/guard.py` (PreToolUse) | Blocks pushes to main/master/default, force pushes without a lease, merging by hand through the API, direct commits through the contents API, repo deletion and edits, branch protection and ruleset changes, and Supabase or psql commands against a remote database. It parses shell quoting, wrappers (`bash -c`, `env`, `timeout`, subshells) `cd`/`git -C`, and branch switches earlier in the same command. |
+| `hooks/guard.py` (PreToolUse) | A small allowlist. `git push` runs only as its own command, `[cd <path> &&] git push [-u] [-q] [--force-with-lease[=<ref>]] [--force-if-includes] [<remote> [<refspec>]]`, to a branch other than main, master or the default branch; any other command with the word `push` next to git, a push alias, a wrapper or a shell expansion is refused. The GitHub API (gh, curl, wget, httpie) is read-only apart from opening a PR, editing its title or body, and comments and reviews. psql, pg_dump and `supabase db`/`migration` reach local databases only. |
 | `claude/CLAUDE.md` | Devin's working rules for cloud sessions: conventional commits, no AI attribution, how and when to land, no production data work. |
 | `claude/settings.json` | The two hooks, no attribution lines (commits, PRs, session links), longer Bash timeouts. |
 
@@ -34,13 +34,14 @@ than adding a second one, so `claude --cloud` picks it without `/remote-env`.
   pre-rename name) in `policy/client-repos.txt`. Those get the PR and stop for review. If
   that file cannot be read, nothing auto-merges.
 - Lands only an open, non-draft PR whose base is the current default branch. Right before
-  the merge it reads the default branch and CI first and the PR last, judges every PR
-  condition on that one read, and pins the merge to the head SHA.
-- CI: every non-advisory check run (newest attempt per check suite, app and name) and
+  the merge it waits until GitHub has computed mergeability, reads the default branch, CI
+  and HEAD, then reads the PR once more, judges every PR condition on that last read, and
+  pins the merge to the head SHA.
+- CI: every non-advisory check run (a re-run replaces an attempt only if it started after that attempt completed; overlapping same-named runs, such as matrix legs, are all judged) and
   commit status must pass or be skipped, with at least one real pass. Failure, cancelled,
   neutral, timed out and action required block. Only skips, or no checks, after 2 minutes
   fails closed (merge by hand on GitHub if a repo has no CI). A pass counts only 45 s after
-  `land`'s own push in this run, so PR workflows have time to register.
+  this run's push and its PR read, so PR workflows have time to register.
 - Once the check runs pass, `land` also requires `mergeable` true and `mergeable_state`
   `clean` or `has_hooks`: GitHub's own roll-up of every status and check. That covers commit
   statuses the cloud GitHub app cannot read (403) and matrix legs. `unstable`, `blocked` or
@@ -50,13 +51,15 @@ than adding a second one, so `claude --cloud` picks it without `/remote-env`.
   "Generated by Claude Code" footer to PR bodies; `land` strips it, and it never reaches
   the default branch.
 - Exit codes: 0 landed or stopped by policy · 1 nothing merged (including GitHub refusing
-  the merge, HTTP 405/409/422) · 3 merged, or merge result still unknown after
+  the merge with HTTP 405/409/422 and then reporting the PR unmerged; a PR found merged at
+  the pushed SHA counts as landed) · 3 merged, or merge result still unknown after
   `LAND_MERGE_CONFIRM` s, but the follow-up failed (finish by hand, do not re-run) · 2 usage.
 - The proxy rejects branch deletion. `land` deletes the head branch through the REST API
   when GitHub's "Automatically delete head branches" is off, only while it still points at
   the merged commit, and reports it if that fails.
 - If the default branch is checked out in another worktree, `land` leaves a detached HEAD at
-  `origin/<default>`.
+  `origin/<default>`. It keeps both branches unless GitHub reports the merged head as the
+  pushed SHA, and reports a failed switch instead of crashing.
 
 Environment knobs: `LAND_OWNERS`, `LAND_CLIENT_REPOS`, `LAND_ADVISORY_CHECKS` (comma
 separated), `LAND_CI_TIMEOUT` (seconds, default 2700), `LAND_NO_CI_GRACE` (120),
@@ -74,7 +77,9 @@ gh api repos/<owner>/<repo> --jq '"id:\(.id)"'
 ```
 
 The `sha256:<hex>` lines are the older form (a hash of the lowercased `owner/repo`). They
-stay for kits installed before the id lines; new entries use ids.
+stay until the pre-purge VM snapshots expire (about 2026-10-29), because those installers
+fetch files without hashes and an old `land` can read this file; then remove them. A new
+`land` refuses to merge if its policy module cannot check ids. New entries use ids.
 
 ## Changing the kit
 
@@ -92,10 +97,15 @@ stay for kits installed before the id lines; new entries use ids.
 
 ## Limits
 
+- `land` deletes a remote branch with a check then a delete; the REST API has no atomic
+  form. A local default branch checked out in another worktree is not fast-forwarded.
+- The one refresh from the b35b3fa installer has no lock exclusion with it.
 - A Node pin narrower than a major (e.g. `<24.1`) installs that major's latest release.
   Poetry venvs outside the repo are not checked, so a deleted one is not reinstalled until
   `poetry.lock` or `pyproject.toml` changes.
 - The guard is a seatbelt for mistakes, not a sandbox. Branch rulesets on GitHub are the hard gate.
+  It refuses some harmless commands on purpose, such as `git commit -m "... push ..."` or
+  `cmd | xargs git ...`; split or reword them.
 - Cloud sessions act on GitHub as the signed-in user through the Claude GitHub App, so a
   ruleset bypass for repository admins also lets cloud sessions through. Leave the bypass
   list empty on repos where cloud sessions must not reach `main`.

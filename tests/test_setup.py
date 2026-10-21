@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 # The real interpreter first: a version-manager shim may refuse to run under a temp HOME.
 PATH = f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"
@@ -133,6 +135,21 @@ def test_refresh_refuses_an_empty_manifest(tmp_path):
     assert (tmp_path / "opt" / "claude-cloud-kit" / "bin" / "land").is_file()
 
 
+@pytest.mark.parametrize("guard", [
+    "import sys\nsys.stdin.read()\n",  # allows everything
+    'import json, sys\nsys.stdin.read()\nprint(json.dumps({"hookSpecificOutput": {"permissionDecision": "deny"}}))\n',
+], ids=["allows-a-push-to-main", "denies-ls"])
+def test_refresh_refuses_a_guard_that_decides_wrongly(tmp_path, guard):
+    assert run_setup(tmp_path).returncode == 0
+    raw = copy_tree(tmp_path / "raw")
+    (raw / "hooks" / "guard.py").write_text(guard)
+    _rehash(raw)
+    proc = run_setup(tmp_path, "--refresh", raw=f"file://{raw}")
+    assert proc.returncode == 0
+    assert "failed verification" in proc.stderr
+    assert (tmp_path / "opt" / "claude-cloud-kit" / "hooks" / "guard.py").read_text() == (ROOT / "hooks" / "guard.py").read_text()
+
+
 def test_refresh_refuses_a_kit_whose_guard_fails(tmp_path):
     assert run_setup(tmp_path).returncode == 0
     raw = copy_tree(tmp_path / "raw")
@@ -144,25 +161,78 @@ def test_refresh_refuses_a_kit_whose_guard_fails(tmp_path):
     assert "sys.exit(1)" not in (tmp_path / "opt" / "claude-cloud-kit" / "hooks" / "guard.py").read_text()
 
 
-def test_a_held_lock_skips_the_run(tmp_path):
+HOLD = """
+import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+print("held", flush=True)
+time.sleep(60)
+"""
+
+
+def hold_lock(tmp_path):
+    """Another installer, alive and holding the kit lock."""
+    holder = subprocess.Popen([sys.executable, "-c", HOLD, str(tmp_path / "opt" / "claude-cloud-kit.flock")],
+                              stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline() == "held\n"
+    return holder
+
+
+def lock_is_free(tmp_path) -> bool:
+    import fcntl
+    with open(tmp_path / "opt" / "claude-cloud-kit.flock", "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+
+def test_a_held_lock_skips_the_run_and_touches_nothing(tmp_path):
     assert run_setup(tmp_path).returncode == 0
-    (tmp_path / "opt" / "claude-cloud-kit.lock").mkdir()
-    proc = run_setup(tmp_path, "--refresh", lock_wait="1")
+    opt = tmp_path / "opt"
+    (opt / "claude-cloud-kit").rename(opt / "claude-cloud-kit.old")  # the holder is mid-swap
+    (opt / ".claude-cloud-kit.abcdef").mkdir()  # and staging
+    holder = hold_lock(tmp_path)
+    try:
+        proc = run_setup(tmp_path, "--refresh", lock_wait="1")
+    finally:
+        holder.kill()
+        holder.wait()
     assert proc.returncode == 0
     assert "another kit install is running" in proc.stderr
+    assert (opt / "claude-cloud-kit.old").is_dir() and not (opt / "claude-cloud-kit").exists()
+    assert (opt / ".claude-cloud-kit.abcdef").is_dir()
 
 
-def test_a_lock_we_do_not_own_is_left_alone(tmp_path):
+def test_a_dead_holder_frees_the_lock_at_once(tmp_path):
     assert run_setup(tmp_path).returncode == 0
-    lock = tmp_path / "opt" / "claude-cloud-kit.lock"
-    lock.mkdir()
-    (lock / "owner").write_text("someone-else\n")
-    run_setup(tmp_path, "--refresh", lock_wait="1")
-    assert (lock / "owner").read_text() == "someone-else\n"
-    lock.joinpath("owner").unlink()
-    lock.rmdir()
-    assert run_setup(tmp_path, "--refresh").returncode == 0
-    assert not lock.exists()
+    holder = hold_lock(tmp_path)
+    holder.kill()
+    holder.wait()
+    proc = run_setup(tmp_path, "--refresh", lock_wait="1")
+    assert proc.returncode == 0 and "another kit install" not in proc.stderr
+    assert lock_is_free(tmp_path)
+
+
+def test_node_installs_do_not_hold_the_kit_lock(tmp_path):
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    # stands in for python3 running `cloud-prep --install-node`: fails if fd 9 is still open
+    (fake / "python3").write_text(f"""#!/bin/sh
+case "$2" in --install-node) if [ -e /dev/fd/9 ]; then echo leaked >>"{tmp_path}/fd9"; fi; exit 0;; esac
+exec "{sys.executable}" "$@"
+""")
+    (fake / "python3").chmod(0o755)
+    env_path = f"{fake}:{PATH}"
+    env = dict(os.environ, PATH=env_path, CLOUD_KIT_RAW=f"file://{ROOT}",
+               CLOUD_KIT_DIR=str(tmp_path / "opt" / "claude-cloud-kit"), CLOUD_KIT_BIN=str(tmp_path / "bin"),
+               HOME=str(tmp_path / "home"))
+    (tmp_path / "opt").mkdir()
+    (tmp_path / "bin").mkdir()
+    proc = subprocess.run(["bash", str(ROOT / "setup.sh")], env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "fd9").exists()
 
 
 def test_a_kit_left_only_as_old_is_restored(tmp_path):
@@ -190,7 +260,7 @@ def test_a_killed_refresh_cleans_up(tmp_path):
     assert proc.returncode != 0
     opt = tmp_path / "opt"
     assert (opt / "claude-cloud-kit" / "bin" / "land").is_file()
-    assert not list(opt.glob(".claude-cloud-kit.*")) and not (opt / "claude-cloud-kit.lock").exists()
+    assert not list(opt.glob(".claude-cloud-kit.*")) and lock_is_free(tmp_path)
 
 
 def test_user_hooks_in_a_kit_group_are_kept(tmp_path):
