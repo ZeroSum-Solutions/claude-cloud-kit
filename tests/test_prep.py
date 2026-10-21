@@ -417,6 +417,20 @@ def test_wait_reports_a_fallback_node_build_as_stale(tmp_path, state, monkeypatc
     assert status.startswith("stale: built with Node 24, which does not satisfy the pin (26)"), status
 
 
+def test_a_python_only_repo_ignores_the_node_pin(tmp_path, state, monkeypatch):
+    # Argon R6: with only uv, a Node pin change or a fallback Node is not a reason to call it stale.
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "uv.lock").write_text("")
+    (repo / ".nvmrc").write_text("26\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="26")
+    assert prep.run_install(repo, 24, None) == 0
+    (repo / ".nvmrc").write_text("22\n")
+    assert prep.wait_status(repo, 1).startswith("ok uv ("), prep.wait_status(repo, 1)
+
+
 def test_a_later_round_records_the_pin_the_repo_holds_then(tmp_path, state, monkeypatch):
     # Argon R5: the pin and a lockfile change during round 1 with no new cloud-prep; round 2
     # reinstalls and records the new pin, not the first request's.

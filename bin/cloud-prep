@@ -732,10 +732,11 @@ def _settled(repo: Path, sd: Path, status: str) -> str:
     if status.startswith("failed") or not plans:
         return status
     node_major = _read_request(sd, (None, None))[0]
-    if _pin_changed(repo, sd) or not all(plan_current(repo, p, node_major, sd) for p in plans):
+    uses_node = _js_plan(repo) is not None  # a Python-only repo does not depend on the Node pin
+    if (uses_node and _pin_changed(repo, sd)) or not all(plan_current(repo, p, node_major, sd) for p in plans):
         return (f"stale: the lockfiles or Node changed after this install ({status}); "
                 "run `cloud-prep` to install again")
-    fallback = _fallback_node(sd)
+    fallback = uses_node and _fallback_node(sd)
     if fallback:
         return f"stale: {fallback} ({status}); run `cloud-prep` again once that Node can be installed"
     return status if status != "none" else "ok (" + ", ".join(f"{p[0]} unchanged" for p in plans) + ")"
