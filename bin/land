@@ -247,6 +247,7 @@ def pr_body(subjects: list[str]) -> str:
 @dataclass
 class Repo:
     nwo: str
+    id: int
     owner: str
     default: str
     delete_branch_on_merge: bool
@@ -267,6 +268,7 @@ def resolve_repo() -> Repo:
         raise Stop(f"✗ cannot read {nwo} through the GitHub proxy: {e.message}")
     return Repo(
         nwo=data["full_name"],
+        id=int(data["id"]),
         owner=data["owner"]["login"],
         default=data["default_branch"],
         delete_branch_on_merge=bool(data.get("delete_branch_on_merge")),
@@ -552,7 +554,7 @@ def main(argv: list[str]) -> int:
     repo = resolve_repo()
     branch, subjects = preflight(repo)
     origin_nwo = parse_nwo(git("remote", "get-url", "origin", check=False)) or repo.nwo
-    may_merge, why = policy_for(repo.nwo, KIT_DIR, aliases=(origin_nwo,))
+    may_merge, why = policy_for(repo.nwo, KIT_DIR, aliases=(origin_nwo,), repo_id=repo.id)
     advisory = split_list(os.environ.get("LAND_ADVISORY_CHECKS")
                           or git("config", "--get", "zs-land.advisoryChecks", check=False))
 

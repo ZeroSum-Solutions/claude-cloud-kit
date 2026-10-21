@@ -568,6 +568,7 @@ def land_policy(name: str | None) -> str:
         return "no GitHub origin; `land` does not apply"
     may_merge, why = policy_for(name, KIT_DIR)
     if may_merge:
+        # by name only; `land` checks the repository id too before it merges
         return f"{name}: `land` merges after green CI"
     return f"{name}: `land` opens the PR and stops for review ({why})"
 

@@ -1,6 +1,7 @@
 import hashlib
 import importlib.machinery
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -37,7 +38,7 @@ def kit(tmp_path, monkeypatch):
     monkeypatch.delenv("LAND_CLIENT_REPOS", raising=False)
     (tmp_path / "policy").mkdir()
     (tmp_path / "policy" / "client-repos.txt").write_text(
-        f"# test policy\nwiggdevin/client-*\n{sha('wiggdevin/Example-Client-Site')}\n")
+        f"# test policy\nwiggdevin/client-*\nid:4242\n{sha('wiggdevin/Example-Client-Site')}\n")
     return tmp_path
 
 
@@ -65,6 +66,25 @@ def test_policy_owner_and_clients(kit):
     assert pol("someone-else/example-client-site") is False       # owner not allowlisted
     # a renamed client repo is still caught through its old (origin) name
     assert pol("wiggdevin/renamed-site", aliases=("wiggdevin/example-client-site",)) is False
+    # and through its repository id, whatever it is called now
+    assert pol("wiggdevin/any-new-name", repo_id=4242) is False
+    assert pol("wiggdevin/any-new-name", repo_id=4243) is True
+    assert pol("wiggdevin/id:4242") is True                        # an id line is not a name glob
+
+
+def test_policy_env_never_replaces_an_empty_file(tmp_path, monkeypatch):
+    (tmp_path / "policy").mkdir()
+    (tmp_path / "policy" / "client-repos.txt").write_text("# comments only\n")
+    monkeypatch.setenv("LAND_CLIENT_REPOS", "someone/else")
+    ok, why = land.policy_for("wiggdevin/zs-land-sandbox", tmp_path)
+    assert ok is False and "no entries" in why
+
+
+def test_policy_fails_closed_on_undecodable_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("LAND_CLIENT_REPOS", raising=False)
+    (tmp_path / "policy").mkdir()
+    (tmp_path / "policy" / "client-repos.txt").write_bytes(b"\xff\xfe\x00bad")
+    assert land.policy_for("wiggdevin/zs-land-sandbox", tmp_path)[0] is False
 
 
 def test_policy_fails_closed_without_the_file(tmp_path, monkeypatch):
@@ -84,10 +104,12 @@ def test_policy_env_overrides(kit, monkeypatch):
 def test_shipped_policy_names_no_client(monkeypatch):
     monkeypatch.delenv("LAND_CLIENT_REPOS", raising=False)
     lines = [ln.split("#", 1)[0].strip() for ln in (ROOT / "policy" / "client-repos.txt").read_text().splitlines()]
-    plain = [ln for ln in lines if ln and not ln.startswith("sha256:")]
-    # only globs and the kit itself are written out; every client is a hash
+    plain = [ln for ln in lines if ln and not ln.startswith(("sha256:", "id:"))]
+    # only globs and the kit itself are written out; every client is an id or a hash
     assert plain == ["zerosum-solutions/claude-cloud-kit", "wiggdevin/client-*"]
+    assert all(re.fullmatch(r"id:\d+|sha256:[0-9a-f]{64}", ln) for ln in lines if ln and ln not in plain)
     assert land.policy_for("ZeroSum-Solutions/claude-cloud-kit", ROOT)[0] is False
+    assert land.policy_for("ZeroSum-Solutions/renamed-kit", ROOT, repo_id=1428360273)[0] is False
 
 
 def test_advisory_names_split_on_commas_only():
@@ -172,7 +194,7 @@ def test_pr_body_lists_commits():
 
 # ------------------------------------------------ CI roll-up when statuses are unreadable
 
-REPO = land.Repo(nwo="o/r", owner="o", default="main", delete_branch_on_merge=True)
+REPO = land.Repo(nwo="o/r", id=1, owner="o", default="main", delete_branch_on_merge=True)
 
 
 def fake_ci(monkeypatch, runs, mergeable_state, head="abc"):
