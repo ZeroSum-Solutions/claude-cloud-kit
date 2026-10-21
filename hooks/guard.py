@@ -6,15 +6,16 @@
                               [--force-if-includes] [<remote> [<refspec>]]
     to a branch other than main, master or the remote's default branch. Any other command
     with the word `push` next to git, hub, a shell expansion, a here-document or a nested
-    shell is refused, prose in a commit message included. git aliases and unknown git
-    subcommands are refused too.
+    shell is refused, prose in a commit message included. git aliases are not inspected.
   - GitHub: merges, auto-merge, repo delete/archive/rename/edit/sync, rulesets and branch
-    protection, and API writes to contents, git refs and objects, hooks, Actions settings and
-    environments. Other GitHub calls pass; the Claude GitHub App has no administration write,
-    so GitHub itself refuses settings changes.
-  - Databases: a remote database host next to a database or migration tool, remote supabase
-    commands, Supabase Management API database calls, and database env vars set to a remote
-    value.
+    protection; `gh api` writes to contents, git refs and objects, hooks, Actions settings and
+    environments; and any other client's call to those api.github.com paths, reads included.
+    Other GitHub calls pass; the Claude GitHub App has no administration write, so GitHub
+    itself refuses settings changes.
+  - Databases: a hosted-Postgres host anywhere in the command, supabase with a remote verb or
+    flag (dump, pull, push, link, repair, fetch, inspect, --linked, --db-url, --project-ref;
+    --local does not exempt them), Supabase Management API database calls, and database env
+    vars set to a remote value.
 
 The GitHub and database rules match the raw command text, here-documents and substitutions
 included, so a command that only mentions one of these is refused too, and the message says
@@ -41,14 +42,14 @@ RULES_HINT = f"Repository settings, branch protection and rulesets are changed b
 API_HINT = ("API writes to contents, git refs and objects, hooks, Actions settings and environments are not "
             f"made from cloud sessions. {LAND_HINT} {SPLIT}")
 DB_HINT = ("Production database changes are not made from cloud sessions. Commit the migration; it is "
-           f"applied from Devin's machine with a backup first. Local runs take --local. {SPLIT}")
-ALIAS_HINT = "git aliases and unknown git subcommands are refused in cloud sessions; run the underlying git command."
+           "applied from Devin's machine with a backup first. Local work: `supabase start`, `supabase db reset`, "
+           f"`supabase migration up` (local by default), or psql/pg_dump against 127.0.0.1. {SPLIT}")
 UNREADABLE = "Could not read this command safely. Split it into simple commands without nested quoting."
 
 _PUSH_WORD = re.compile(r"\b(?:push|send-pack)\b")
 _GIT_WORD = re.compile(r"\b(?:git|hub)\b")
 _HIDDEN = re.compile(r"[$`]|<<|<\(|>\(|\b(?:eval|xargs|bash|sh|zsh|dash|ksh)\b")
-_RISKY = re.compile(r"\b(?:git|hub|gh|curl|wget|http|https|psql|pg_dump|pg_restore|pgcli|supabase|"
+_RISKY = re.compile(r"\b(?:git|hub|gh|curl|wget|http|https|xh|psql|pg_dump|pg_restore|pgcli|supabase|"
                     r"postgres|postgresql|PGHOST|DATABASE_URL)\b")
 
 
@@ -174,60 +175,30 @@ def check_push(args: list[str], where: str | None) -> str | None:
     return None
 
 
+# `git [global options] stash push`: options that take a value consume it, so a value that
+# ends in "stash" (`git -C /tmp/stash push`) is not read as the subcommand.
+_VALUE_OPTS = r"(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)"
+_STASH_PUSH = re.compile(rf"\bgit\s+(?:{_VALUE_OPTS}\s+\S+\s+|(?!{_VALUE_OPTS}\s)--?[\w-]+(?:=\S*)?\s+)*stash\s+push\b")
+
+
 def could_push(command: str) -> bool:
     for text in (command, re.sub(r"[\\'\"]", "", command)):  # "gi""t" and g\it spell git
-        text = re.sub(r"\bstash\s+push\b", "stash", text)
+        text = _STASH_PUSH.sub(lambda m: m.group(0)[:-len("push")], text)
         if _PUSH_WORD.search(text) and (_GIT_WORD.search(text) or _HIDDEN.search(text)):
             return True
     return False
 
 
-# ---------------------------------------------------------------- git subcommands
-
-
-GIT_BUILTINS = set("""
-add am annotate apply archimport archive backfill bisect blame branch bugreport bundle cat-file check-attr
-check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick citool clean clone
-column commit commit-graph commit-tree config count-objects credential credential-cache credential-store
-cvsexportcommit cvsimport cvsserver daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree
-difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo
-format-patch fsck fsck-objects gc get-tar-commit-id grep gui hash-object help history hook http-backend
-http-fetch http-push imap-send index-pack init init-db instaweb interpret-trailers last-modified lfs log
-ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index
-merge-one-file merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes p4 pack-objects
-pack-redundant pack-refs patch-id prune prune-packed pull push quiltimport range-diff read-tree rebase
-receive-pack reflog refs remote repack replace replay repo request-pull rerere reset restore rev-list
-rev-parse revert rm send-email send-pack shell shortlog show show-branch show-index show-ref sparse-checkout
-stage stash status stripspace submodule subtree switch symbolic-ref tag unpack-file unpack-objects
-update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack
-verify-tag version whatchanged worktree write-tree
-""".split())
-# `git` in command position (after a separator, a quote, assignments or a wrapper), its global
-# options, then the subcommand.
-_GIT_CMD = re.compile(
-    r"(?:^|[;&|(){}`!\n'\"]|\$\()\s*"
-    r"(?:(?:[A-Za-z_]\w*=\S*|env|sudo|nohup|nice|time|timeout|command|exec|xargs|then|do|else|-\S+|\d\S*)\s+)*"
-    r"(?:\S*/)?git\s+"
-    r"(?:(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)\s+\S+\s+|-\S+\s+)*"
-    r"([^\s;&|()<>-][^\s;&|()<>]*)")
-
-
-def check_git(command: str) -> str | None:
-    for m in _GIT_CMD.finditer(command):
-        sub = re.sub(r"[\\'\"]", "", m.group(1))
-        if sub and sub not in GIT_BUILTINS:
-            return f"`git {sub}`: {ALIAS_HINT}"
-    return None
-
-
 # ---------------------------------------------------------------- GitHub
 
 
-_MERGE = re.compile(r"\bpulls/\S*/merge\b|/merges\b|/merge-upstream\b|\bpr\s+merge\b|\bauto-merge\b"
-                    r"|enablePullRequestAutoMerge|mergePullRequest")
+_FLAGS = r"(?:\s+-\S+(?:\s+[^-\s]\S*)?)*"  # flags between words: `gh pr -R o/r merge`
+_MERGE = re.compile(r"\bpulls/\S*/merge\b|/merges\b|/merge-upstream\b|\bpr\b" + _FLAGS + r"\s+merge\b"
+                    r"|\bauto-merge\b|enablePullRequestAutoMerge|mergePullRequest")
 _GH_VARIABLE = re.compile(r"\b(?:gh|hub)\s+(?:(?:pr|repo)\s+)?[\"']?[$`]")  # gh pr $A
-_SETTINGS = re.compile(r"\brepo\s+(?:delete|archive|rename|edit|sync)\b|\bruleset|/protection\b")
-_GITHUB_API = re.compile(r"api\.github\.com|\b(?:gh|hub)\b.*\bapi\b", re.IGNORECASE)
+_SETTINGS = re.compile(r"\brepo\b" + _FLAGS + r"\s+(?:delete|archive|rename|edit|sync)\b|\bruleset|/protection\b")
+_RAW_GITHUB = re.compile(r"api\.github\.com", re.IGNORECASE)
+_GH_API = re.compile(r"\b(?:gh|hub)\b.*\bapi\b", re.IGNORECASE | re.DOTALL)
 _GITHUB_WRITE_PATH = re.compile(r"/contents/|/git/(?:refs|commits|trees|blobs|tags)\b|/hooks\b"
                                 r"|/actions/(?:secrets|variables|permissions)\b|/environments/")
 _WRITE = re.compile(r"(?<![\w-])(?:-X|-d|-T|--method|--request|--data[\w-]*|--field|--raw-field|--input"
@@ -244,7 +215,9 @@ def check_github(command: str) -> str | None:
         return f"A gh subcommand held in a variable can't be checked; spell it out. {LAND_HINT}"
     if _SETTINGS.search(text):
         return RULES_HINT
-    if _GITHUB_API.search(text) and _GITHUB_WRITE_PATH.search(text) and _WRITE.search(text):
+    # gh/hub api: writes only. Any other client: every method (curl -T, HTTPie fields and others imply writes).
+    if _GITHUB_WRITE_PATH.search(text) and (
+            _RAW_GITHUB.search(text) or (_GH_API.search(text) and _WRITE.search(text))):
         return API_HINT
     return None
 
@@ -254,34 +227,30 @@ def check_github(command: str) -> str | None:
 
 _REMOTE_HOST = re.compile(r"\.supabase\.co\b|pooler\.supabase\.com|\.rds\.amazonaws\.com|\.neon\.tech|\.render\.com"
                           r"|\.railway\.app|\.aivencloud\.com|\.cockroachlabs\.cloud", re.IGNORECASE)
-_DB_TOOL = re.compile(r"(?<![\w.-])(?:psql|pg_dump|pg_dumpall|pg_restore|pgcli|usql|supabase|prisma|drizzle-kit"
-                      r"|knex|sqitch|flyway|dbmate|migrate)(?![\w-])")
 _PG_CLIENT = re.compile(r"(?<![\w.-])(?:psql|pg_dump|pg_dumpall|pg_restore|pgcli|usql)(?![\w-])")
 _PG_HOST = re.compile(r"postgres(?:ql)?://(?:[^@/\s'\"]*@)?([^/?\s'\"]*)|(?:host|hostaddr)\s*=\s*['\"]?([^\s'\";&]*)"
                       r"|(?<![\w-])(?:-h|--host)(?:\s+|=)?['\"]?([^\s'\"]*)")
 _LOCAL = re.compile(r"|/.*|%2f.*|(?:localhost|127\.0\.0\.1|::1|\[::1\])(?::\d+)?", re.IGNORECASE)
 _DB_ENV = re.compile(r"\b(PGHOST|PGHOSTADDR|PGSERVICE|DATABASE_URL|SUPABASE_DB_URL|POSTGRES_URL)=['\"]?([^\s'\"]*)")
-_LOCAL_VALUE = re.compile(r"|/.*|(?:[\w+]+://(?:[^@/\s]*@)?)?(?:localhost|127\.0\.0\.1|\[::1\])(?:[:/?].*)?",
+_LOCAL_VALUE = re.compile(r"|/.*|(?:sqlite3?|file):.*|::1"
+                          r"|(?:[\w+]+://(?:[^@/\s]*@)?)?(?:localhost|127(?:\.\d+){3}|\[::1\])(?:[:/?].*)?",
                           re.IGNORECASE)
-_SUPABASE = re.compile(r"(?<![\w.-])supabase(?![\w-])")
-_SUPABASE_REMOTE = re.compile(r"--linked\b|--db-url\b|--project-ref\b|\bpush\b|\blink\b|[$`]")
-_SUPABASE_UNLESS_LOCAL = re.compile(r"\bmigrations?\s+(?:up|repair|squash|fetch)\b|\bdb\s+(?:dump|pull)\b|\binspect\b")
+# supabase as a command (node_modules/.bin/supabase too), not a path or package (supabase/migrations, @supabase/ssr)
+_SUPABASE = re.compile(r"(?<![\w.@-])supabase(?![\w/-])")
+_SUPABASE_REMOTE = re.compile(r"--linked\b|--db-url\b|--project-ref\b|[$`]"
+                              r"|\b(?:dump|pull|push|link|repair|fetch|inspect)\b")
 
 
 def check_db(command: str) -> str | None:
-    if _REMOTE_HOST.search(command) and _DB_TOOL.search(command):
+    if _REMOTE_HOST.search(command):  # whatever the tool: psql, python -c, node -e, an env var
         return DB_HINT
     for name, value in _DB_ENV.findall(command):
         if name == "PGSERVICE" or "$" in value or not _LOCAL_VALUE.fullmatch(value):
             return f"`{name}` must name a local database here. {DB_HINT}"
-    if _SUPABASE.search(command):
-        if _SUPABASE_REMOTE.search(command) or (
-                _SUPABASE_UNLESS_LOCAL.search(command) and not re.search(r"--local\b", command)):
-            return DB_HINT
+    if _SUPABASE.search(command) and _SUPABASE_REMOTE.search(command):  # --local does not exempt
+        return DB_HINT
     if re.search(r"api\.supabase\.com", command, re.IGNORECASE) and (
             re.search(r"/database/(?:query|migrations)", command) or _WRITE.search(command)):
-        return DB_HINT
-    if re.search(r"\.supabase\.co\b", command, re.IGNORECASE) and _WRITE.search(command):
         return DB_HINT
     if _PG_CLIENT.search(command):
         if re.search(r"[$`]|\bservice\s*=", command):
@@ -300,6 +269,7 @@ def check_db(command: str) -> str | None:
 
 
 def _decide(command: str, cwd: str | None) -> str | None:
+    command = command.replace("\\\n", " ")  # line continuations: `gh \<newline> api`
     form = push_form(command)
     if form is not None:
         cd, args = form
@@ -310,7 +280,7 @@ def _decide(command: str, cwd: str | None) -> str | None:
         return check_push(args, cwd)
     if could_push(command):
         return PUSH_HINT
-    return check_git(command) or check_github(command) or check_db(command)
+    return check_github(command) or check_db(command)
 
 
 def decide(command: str, cwd: str | None) -> str | None:

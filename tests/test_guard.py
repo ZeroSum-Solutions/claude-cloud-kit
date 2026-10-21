@@ -303,9 +303,6 @@ BYPASSES = [
     "supabase --log-level debug db push",
     "npx --yes --package supabase supabase db push",
     "npm exec --package supabase -- supabase db push",
-    "cd /other && git publish",
-    "git -C /other publish",
-    "git publish",
     "cat <<EOF\n`gh api -X PUT repos/o/r/pulls/5/merge`\nEOF",
     "curl -X PUT https://api.github.com./repos/o/r/pulls/5/merge",
     "curl -X PUT https://API.GitHub.com./repos/o/r/contents/a -d '{}'",
@@ -336,12 +333,41 @@ BYPASSES = [
     'echo "supabase db reset --linked" | bash',
     "env -C /tmp/echo gh pr merge 5",
     "sudo -u printf gh api -X PUT repos/o/r/pulls/5/merge",
-    "cd /other-repo && git ship",
-    "git config alias.run '!sh s.sh' && git run",
+]
+
+# Every round-5 BLOCK repro (Sol, Argon) the coarser rules catch.
+BYPASSES += [
+    "supabase db --debug dump -f backup.sql",
+    "supabase db -f out.sql dump",
+    "supabase db --schema auth pull",
+    "supabase migration --debug repair 20240101 --status applied",
+    "supabase migration --debug fetch",
+    "supabase db dump -f x && supabase db reset --local",
+    "supabase db dump --local=false -f backup.sql",
+    "supabase db pull --local=0",
+    "node_modules/.bin/supabase db dump",
+    """python -c 'import psycopg; psycopg.connect("postgresql://u@db.example.supabase.co/postgres", autocommit=True).execute("drop table t")'""",
+    "psql -Xqh db.abc.supabase.co -c 'delete from users'",
+    "pg_dump -ch db.abc.supabase.co app",
+    "http api.github.com/repos/o/r/contents/README.md message=fix content=eA==",
+    "curl -fsST body.json https://api.github.com/repos/o/r/contents/README.md",
+    "gh \\\n  api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+    "gh -R o/r \\\n  api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+    "gh pr -R o/r merge 5 --squash",
+    "gh repo -R o/r edit --default-branch x",
+    "git -C /tmp/stash push origin main",
+    "git -C ../stash push --force origin feat/x",
+    "git -c x=stash push origin main",
+    "git --namespace=stash push origin main",
+    "git --namespace stash push origin main",
 ]
 
 # Harmless commands refused on purpose: the price of matching raw text instead of parsing shell.
 REFUSED_ON_PURPOSE = [
+    # supabase remote verbs, --local or not; hosted hosts anywhere; raw clients on sensitive GitHub paths
+    "supabase db dump --local -f x.sql",
+    "echo postgresql://x@db.abc.supabase.co",
+    "curl -fsSL https://api.github.com/repos/o/r/contents/README.md",
     # text that only mentions a guarded command
     "echo 'gh pr merge 1'",
     "echo gh pr merge 1",
@@ -349,7 +375,6 @@ REFUSED_ON_PURPOSE = [
     "cat <<'EOF' > pr.md\n## Summary\n- Fix array.push bug\nEOF",
     "git commit -m \"$(cat <<'EOF'\nfeat: add web push notifications\nEOF\n)\"",
     'gh pr create --title t --body "Turns on auto-merge for docs"',
-    'git commit -m "git hooks: run lint"',
     # reads on paths the merge and settings rules match
     "gh api repos/o/r/pulls/5/merge",
     "gh api repos/o/r/rulesets",
@@ -361,7 +386,6 @@ REFUSED_ON_PURPOSE = [
     'DATABASE_URL="postgresql://postgres:postgres@localhost:$PORT/app" npm test',
     'DATABASE_URL="sqlite:///$TMPDIR/test.db" pytest',
     # git aliases, even harmless ones
-    "git co feat/x",
     "git push origin @",
     "git push --no-verify -u origin HEAD",
     "git push -u origin HEAD 2>&1 | tail -3",
@@ -375,13 +399,26 @@ REFUSED_ON_PURPOSE = [
     "git checkout -b feat/new && git push -u origin HEAD",
     "gh api -X DELETE repos/o/r/git/refs/heads/feat/x",
     "gh api repos/o/r/git/refs -f ref=refs/heads/feat/y -f sha=abc",
-    "supabase migration up",
     "supabase migration list --linked",
     "psql -h db.internal app",
     "cat > notes.md <<'EOF'\nsupabase db push\nEOF",
 ]
 
 ALLOWED = [
+    'git -c user.name="Cloud Agent" commit -m "fix: validate inputs"',
+    'git commit -m "docs: document `git status` output"',
+    'git commit -m "git hooks: run lint"',
+    "DATABASE_URL=sqlite:///tmp/test.db python -m pytest -q",
+    "DATABASE_URL=file:./test.db npm test",
+    'PGHOST=::1 psql -c "SELECT 1"',
+    "supabase start",
+    "supabase db reset",
+    "supabase migration up",
+    "pnpm add @supabase/ssr",
+    "git add supabase/migrations/20261021_x.sql",
+    "gh api repos/o/r/pulls -X POST -f title=t -f head=b -f base=main",
+    "gh api repos/o/r/issues/1/comments -f body=x",
+    "git stash push -u -m wip",
     "git push -u origin HEAD",
     "git push origin HEAD",
     "git push --set-upstream origin HEAD",
@@ -441,7 +478,6 @@ ALLOWED = [
     "supabase status",
     "supabase stop",
     "supabase db reset",
-    "supabase db dump --local -f x.sql",
     "supabase migration new add_table",
     "supabase migration list",
     "supabase migration up --local",
@@ -456,7 +492,6 @@ ALLOWED = [
     "psql app",
     "pg_dump -h localhost app > dump.sql",
     "DATABASE_URL=postgres://u:p@localhost:5432/app npm test",
-    "echo postgresql://x@db.abc.supabase.co",
     "npm test",
     "bash scripts/test.sh",
     "bash -c 'npm test && npm run lint'",
@@ -475,7 +510,6 @@ ALLOWED = [
     "curl -s https://api.github.com/repos/o/r/actions/runs/$RUN_ID/jobs",
     "curl -s http://localhost:$PORT/health",
     'curl -X POST "http://localhost:$PORT/api/items"',
-    "curl -fsSL https://api.github.com/repos/o/r/contents/README.md",
     "rg supabase db",
     "grep -r supabase db",
     "git grep supabase db",
@@ -511,12 +545,26 @@ ALLOWED_BY_DESIGN = [
 ]
 
 
+# Not inspected (README, Limits): git aliases, and remote hosts other than the hosted-Postgres list
+# when the host is hidden in bundled client flags. Rulesets and App permissions are the gate.
+NOT_INSPECTED = [
+    "git publish",
+    "cd /other && git publish",
+    "git -C /other publish",
+    "if git publish; then echo shipped; fi",
+    "sudo -u root git publish",
+    "git co feat/x",
+    "git config alias.run '!sh s.sh' && git run",
+    "psql -Xqh db.internal app",
+]
+
+
 @pytest.mark.parametrize("cmd", BLOCKED + BYPASSES + REFUSED_ON_PURPOSE)
 def test_blocked(fake_git, cmd):
     assert guard.decide(cmd, None), cmd
 
 
-@pytest.mark.parametrize("cmd", ALLOWED + ALLOWED_BY_DESIGN)
+@pytest.mark.parametrize("cmd", ALLOWED + ALLOWED_BY_DESIGN + NOT_INSPECTED)
 def test_allowed(fake_git, cmd):
     assert guard.decide(cmd, None) is None, cmd
 
@@ -553,14 +601,6 @@ def test_configured_push_refspec(fake_git):
     for cmd in ("git push", "git push origin", "git push origin HEAD", "git push origin feat/x"):
         assert guard.decide(cmd, None), cmd
     assert guard.decide("git push origin HEAD:feat/x", None) is None
-
-
-def test_unknown_git_subcommands(fake_git):
-    for cmd in ("git p", "git P", "git status && git sh", "git st", "timeout 60 git ship",
-                "bash -c 'git ship'", 'echo "$(git ship)"', "/usr/bin/git ship", "git -c x.y=1 ship"):
-        assert guard.ALIAS_HINT in guard.decide(cmd, None), cmd
-    for cmd in ("git status", "git -C /tmp/r log --oneline", "git --version", "GIT_TRACE=1 git fetch"):
-        assert guard.decide(cmd, None) is None, cmd
 
 
 def test_remote_db_from_environment(fake_git, monkeypatch):
@@ -671,16 +711,6 @@ def test_configured_push_destinations(make_repo):
     git(work, "config", "remote.origin.mirror", "true")
     assert guard.decide("git push", str(work))
     assert guard.decide("git push origin HEAD:feat/x", str(work))
-
-
-def test_aliases_refused_in_any_repo(make_repo):
-    work = make_repo()
-    other = make_repo("other")
-    git(other, "config", "alias.publish", "inner")
-    git(other, "config", "alias.inner", "push origin main")
-    git(work, "config", "alias.co", "checkout")
-    for cmd in ("git co feat/x", f"cd {other} && git publish", f"git -C {other} publish"):
-        assert guard.decide(cmd, str(work)), cmd
 
 
 def test_hook_outside_cloud_allows(monkeypatch, capsys):
