@@ -16,11 +16,14 @@ spec.loader.exec_module(guard)
 @pytest.fixture
 def fake_git(monkeypatch):
     """Pretend the session repo is on feat/x with main as the default branch."""
-    state = {"branch": "feat/x", "default": "main", "push": None, "config": ""}
+    state = {"branch": "feat/x", "default": "main", "push": None, "config": "", "aliases": {}}
     monkeypatch.setattr(guard, "current_branch", lambda where: state["branch"])
     monkeypatch.setattr(guard, "default_branch", lambda where, remote="origin": state["default"])
     monkeypatch.setattr(guard, "push_target", lambda where: state["push"])
     monkeypatch.setattr(guard, "push_config", lambda where: state["config"])
+    monkeypatch.setattr(guard, "git_aliases", lambda where: state["aliases"])
+    for name in ("PGHOST", "PGHOSTADDR", "PGSERVICE"):
+        monkeypatch.delenv(name, raising=False)
     return state
 
 
@@ -31,6 +34,8 @@ BLOCKED = [
     "git push origin feat/x:refs/heads/main",
     "git push origin HEAD:heads/main",
     "git push origin HEAD:refs/heads/master",
+    "git push origin HEAD:Main",
+    "git push origin heads/main",
     "git push -u origin master",
     "git push origin main 2>&1 | tail -5",
     "git push origin main > /tmp/out.log",
@@ -44,6 +49,8 @@ BLOCKED = [
     "git push origin 'refs/heads/*:refs/heads/*'",
     "git push origin --delete main",
     "git push origin :main",
+    "git push origin feat/x feat/y",
+    "git push https://github.com/o/r.git HEAD",
     # refspecs the guard can't see
     "dst=main; git push origin HEAD:$dst",
     "git push origin HEAD:$BRANCH",
@@ -94,6 +101,27 @@ BLOCKED = [
     'echo "$(git push origin main)"',
     'out="$(git push origin main 2>&1)"; echo "$out"',
     'echo "`git push origin main`"',
+    '"gi""t" push origin main',
+    "g\\it push origin main",
+    "hub push origin main",
+    # branch switches before a push (any compound command with a push is refused)
+    "git checkout main && git push -u origin HEAD",
+    "git switch main; git push origin @",
+    "git checkout -q main && git push origin HEAD",
+    "git checkout -B main && git push origin HEAD",
+    "git switch -c main origin/main && git push origin HEAD",
+    "git switch --create=main && git push origin HEAD",
+    "git checkout -t origin/main && git push origin HEAD",
+    "git branch -m main && git push origin HEAD",
+    "git branch -M feat/x main && git push origin HEAD",
+    "git symbolic-ref HEAD refs/heads/main && git push origin HEAD",
+    "git checkout --detach && git push origin HEAD",
+    "git checkout - && git push origin HEAD",
+    "git checkout $BRANCH && git push origin HEAD",
+    "gh pr checkout 5 && git push origin HEAD",
+    "git checkout feat/other && git push",
+    "(git checkout main) && git push origin HEAD",
+    "bash -c 'git checkout main && git push -u origin HEAD'",
     # merging, or moving protected refs, through the API
     "gh pr merge 5 --squash",
     "gh -R o/r pr merge 5",
@@ -104,9 +132,11 @@ BLOCKED = [
     "gh api --method PUT repos/o/r/pulls/12/merge",
     "gh api --method=PUT repos/o/r/pulls/12/merge",
     "gh api -XPUT repos/o/r/pulls/12/merge",
+    "gh api -iX PUT repos/o/r/pulls/12/merge",
     "gh api -X PUT repos/o/r/pulls/$PR/merge --input b.json",
     "gh api -X PUT 'repos/{owner}/{repo}/pulls/5/merge'",
     "NWO=o/r; gh api -X PUT repos/$NWO/pulls/5/merge",
+    "hub api -X PUT repos/o/r/pulls/5/merge",
     "curl -X PUT https://api.github.com/repos/o/r/pulls/3/merge",
     "curl --request PUT https://api.github.com/repos/o/r/pulls/1/merge",
     "curl --request=PUT https://api.github.com/repos/o/r/pulls/1/merge",
@@ -114,6 +144,10 @@ BLOCKED = [
     "curl -sX PUT -H 'Authorization: token x' https://api.github.com/repos/o/r/pulls/1/merge",
     ("curl \\\n  -H 'Accept: application/vnd.github+json' \\\n  -d '{\"merge_method\":\"squash\"}' \\\n"
      "  https://api.github.com/repos/o/r/pulls/7/merge"),
+    "wget --method=PUT https://api.github.com/repos/o/r/pulls/1/merge",
+    "wget --post-data '{}' https://api.github.com/repos/o/r/merges",
+    "http PUT api.github.com/repos/o/r/pulls/1/merge",
+    "http api.github.com/repos/o/r/merges base=main head=feat/x",
     "gh api repos/o/r/merges -f base=main -f head=feat/x",
     "gh api -X POST repos/o/r/merge-upstream -f branch=main",
     "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc",
@@ -124,10 +158,23 @@ BLOCKED = [
     "gh api -X DELETE repos/o/r/contents/README.md -f message=x -f sha=abc",
     "gh api -X POST \"$URL\" -f x=1",
     "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
+    "gh api graphql -F query=@q.graphql",
+    "curl -X POST https://api.github.com/graphql -d '{\"query\":\"mutation { deleteRef(input: {}) { x } }\"}'",
+    # pull requests: state and base stay with `land`
+    "gh api -X PATCH repos/o/r/pulls/5 -f state=closed",
+    "gh api -X PATCH repos/o/r/pulls/5 -f base=main",
+    "gh api -X PATCH repos/o/r/pulls/5 --input -",
+    "curl -X PATCH https://api.github.com/repos/o/r/pulls/5 -d '{\"state\":\"closed\"}'",
+    "curl -X PATCH https://api.github.com/repos/o/r/pulls/5 -d @body.json",
+    "gh api -X POST repos/o/r/pulls/5/requested_reviewers -f reviewers[]=x",
     # repository settings, protection and rulesets
     "gh repo delete o/r --yes",
     "gh repo archive o/r -y",
+    "gh repo rename new-name",
     "gh repo edit o/r --default-branch dev",
+    "gh repo sync o/r --branch main --force",
+    "gh ruleset list",
+    "gh alias set m 'pr merge'",
     "gh api -X DELETE repos/o/r",
     "NWO=o/r; gh api -X DELETE repos/$NWO",
     "gh api -X PATCH repos/o/r -F archived=true",
@@ -156,81 +203,234 @@ BLOCKED = [
     "supabase migration up --linked",
     "supabase migration up --db-url postgres://x",
     "supabase db diff --db-url=postgresql://x",
+    "supabase db push --local --project-ref abc",
+    "supabase inspect db bloat",
     "psql postgresql://postgres:pw@db.abc.supabase.co:5432/postgres -c 'select 1'",
     "pg_dump -h db.abc.supabase.co -U postgres",
+    "pg_dump -hdb.abc.supabase.co -U postgres",
+    "psql --host=db.example.net app",
+    "psql 'host=db.example.net dbname=app'",
+    "psql 'service=prod'",
+    "psql 'postgresql:///app?host=db.example.net'",
     "PGHOST=db.abc.supabase.co psql -U postgres",
     "node migrate.js postgresql://postgres:pw@db.abc.supabase.co:5432/postgres",
     "DATABASE_URL=postgres://u:p@aws-0-us-east-1.pooler.supabase.com:6543/postgres node migrate.js",
+    "SUPABASE_DB_URL=$PROD npm run migrate",
+    "curl -X POST https://abc.supabase.co/rest/v1/users -d '{}'",
     # unparseable but risky
     "git push origin 'main",
+    "gh pr merge 'x",
+]
+
+# Every guard bypass the round-3 review (GPT-6.1 Sol, Gemini 4 Argon) found.
+BYPASSES = [
+    # Sol
+    "git switch does-not-exist; git push origin HEAD",
+    "git switch -cmain && git push origin HEAD",
+    "git checkout -bmain && git push origin HEAD",
+    "git checkout main -- && git push origin HEAD",
+    "(cd /feature-repo && git status); git push origin HEAD",
+    "git -C/on-main push origin HEAD",
+    "GIT_DIR=/on-main/.git git push origin HEAD",
+    "env -C /on-main git push origin HEAD",
+    "env PGHOST=db.example.supabase.co psql -c 'delete from t'",
+    'git -c alias.publish="push origin HEAD:main" publish',
+    "dst=main; git push origin -- HEAD:$dst",
+    'METHOD=PUT; gh api -X "$METHOD" repos/o/r/pulls/5/merge',
+    "cat <<EOF\n$(git push origin HEAD:main)\nEOF",
+    "psql postgresql://u@db.example.net/app -c 'delete from t'",
+    'psql "$DATABASE_URL" -f migration.sql',
+    "curl -X POST https://api.supabase.com/v1/projects/example/database/query --json '{\"query\":\"delete from t\"}'",
+    # Argon: unquoted command substitution
+    "git -C $(pwd) push origin main",
+    "git -C `pwd` push origin main",
+    "git -C $(pwd) push --force origin feat/x",
+    "git push `echo origin` main",
+    "git push `echo -f` origin feat/x",
+    "git push -o $(echo x) origin main",
+    "git push --repo $(echo origin) main",
+    "gh api -H $(echo Accept:text/plain) -X PUT repos/o/r/pulls/5/merge",
+    "curl -H $(echo X:1) -X PUT https://api.github.com/repos/o/r/pulls/1/merge",
+    "curl $(echo -X PUT) https://api.github.com/repos/o/r/pulls/1/merge",
+    "supabase --workdir $(pwd) db push",
+    "psql $(echo -w) postgresql://postgres:pw@db.abc.supabase.co:5432/postgres",
+    # Argon: long-option prefixes and attached git options
+    "git push --al origin",
+    "git push --br origin",
+    "git push --mi origin",
+    "git -cremote.origin.push=HEAD:refs/heads/main push origin",
+    "git -cpush.default=matching push",
+    # Argon: branch moves
+    "git checkout -Bmain && git push origin HEAD",
+    "git switch -Cmain origin/main && git push origin HEAD",
+    "git checkout --conflict merge main && git push origin HEAD",
+    "git branch -qm main && git push origin HEAD",
+    "git branch -fM main && git push origin HEAD",
+    "git rebase origin/main main && git push -u origin HEAD",
+    # Argon: quoting, here-strings and here-documents
+    "bash -c $'git push origin main'",
+    'bash -c $"git push origin main"',
+    "$'git' push origin main",
+    "$'gh' pr merge 5",
+    "$'\\x67h' pr merge 5",
+    "$'supabase' db push",
+    "bash <<< 'git push origin main'",
+    "sh <<< 'gh pr merge 5 --squash'",
+    "\"bash\" <<'EOF'\ngit push origin main\nEOF",
+    "\\bash <<'EOF'\ngit push origin main\nEOF",
+    "\"bash\" <<'EOF'\ngh pr merge 5\nEOF",
+    "cat <<'EOF' |\ngit push origin main\nEOF\nbash",
+    # Argon: variables and exports
+    "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push origin",
+    "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main && git push origin",
+    'U=postgresql://postgres:pw@db.abc.supabase.co:5432/postgres; psql "$U" -c "select 1"',
+    "env PGHOST=db.abc.supabase.co psql -U postgres",
+    "export PGHOST=db.abc.supabase.co && psql -U postgres",
+    "env DATABASE_URL=postgres://u:p@aws-0-us-east-1.pooler.supabase.com:6543/postgres node migrate.js",
+    "P=push; git $P origin main",
+    "A=merge; gh pr $A 5 --squash",
+    "S=api; gh $S -X PUT repos/o/r/pulls/5/merge",
+    'M=PUT; gh api -X "$M" repos/o/r/pulls/5/merge',
+    'URL=https://api.github.com/repos/o/r/pulls/5/merge; curl -X PUT "$URL"',
+    "A=push; supabase db $A",
+    'C=gh; "$C" pr merge 5',
+    # Argon: xargs
+    'echo "push origin main" | xargs git',
+    'echo "-X PUT" | xargs gh api repos/o/r/pulls/5/merge',
+    "echo https://api.github.com/repos/o/r/pulls/5/merge | xargs curl -X PUT",
+    "echo push | xargs supabase db",
+    # Argon: persistent config and plumbing
+    'git config alias.p "push origin main" && git p',
+    "git config remote.origin.push HEAD:refs/heads/main && git push origin",
+    "git send-pack origin HEAD:refs/heads/main",
+    # Argon: API paths
+    "gh api -X PUT repos/o/r/./pulls/5/merge",
+    "curl -X PUT https://api.github.com/repos/o/r/./pulls/5/merge",
+    'gh api -X PUT "repos/o/r/pulls/5/merge#"',
+    "curl -X PUT 'https://api.github.com/repos/o/r/pulls/5/merge#'",
+    "gh api -X PATCH 'repos/o/r/git/refs/heads/main#' -f sha=abc",
+    "gh api -X PUT 'repos/o/r/branches/main/protection#' --input p.json",
+    "gh api -X PUT repositories/12345/pulls/5/merge",
+    "curl -X PUT https://api.github.com/repositories/12345/pulls/5/merge",
+    "gh api -X POST 'repos/o/r/pulls/5/comments/../../../merges' -f base=main",
+    "gh api -X POST 'repos/o/r/pulls%2F5%2Fmerge'",
+]
+
+# Harmless commands the allowlist refuses on purpose: the price of not parsing shell.
+REFUSED_ON_PURPOSE = [
+    "git push origin @",
+    "git push --no-verify -u origin HEAD",
+    "git push -u origin HEAD 2>&1 | tail -3",
+    "git push --force-with-lease origin +feat/x",
+    "git push origin --delete old-feature",
+    "git push origin :old-feature",
+    'git commit -m "do not push to main"',
+    "git log --grep 'push origin main'",
+    "echo 'git push origin main is blocked' > notes.txt",
+    "# don't push to main\ngit status",
+    "git checkout -b feat/new && git push -u origin HEAD",
+    "gh api -X DELETE repos/o/r/git/refs/heads/feat/x",
+    "gh api repos/o/r/git/refs -f ref=refs/heads/feat/y -f sha=abc",
+    "supabase migration up",
+    "supabase migration list --linked",
+    "psql -h db.internal app",
+    "cat > notes.md <<'EOF'\nsupabase db push\nEOF",
+    '"$PYTHON" -m pytest',
 ]
 
 ALLOWED = [
     "git push -u origin HEAD",
     "git push origin HEAD",
-    "git push origin @",
-    "git push -u origin feat/x",
+    "git push --set-upstream origin HEAD",
+    "git push -q -u origin feat/x",
     "git push origin HEAD:feat/x",
     "git push origin HEAD:refs/heads/feat/main-fix",
+    "git push origin feat/x:feat/x",
+    "git push origin 'HEAD:feat/x'",
     "git push",
-    "git push --no-verify -u origin HEAD",
-    "git push -u origin HEAD 2>&1 | tail -3",
+    "git push origin",
+    "git push origin v1.0",
     "git push --force-with-lease origin feat/x",
     "git push --force-with-lease=feat/x:abc origin HEAD",
-    "git push --force-with-lease origin +feat/x",
     "git push --force-with-lease --force-if-includes origin feat/x",
-    "git push origin --delete old-feature",
-    "git push origin :old-feature",
-    "git push origin v1.0",
+    "git push -u origin HEAD  # first push",
+    "cd /tmp/repo && git push -u origin HEAD",
     "git status && git log --oneline -5",
+    "git stash push -m wip",
     "land",
     "land --pr",
-    'git commit -m "do not push to main"',
-    "git commit -m 'never git push origin main'",
-    "git log --grep 'push origin main'",
-    "echo 'gh pr merge 1'",
-    "echo 'git push origin main is blocked' > notes.txt",
-    "cat > notes.md <<'EOF'\ngit push origin main\ngh pr merge 5\nEOF",
-    "git commit -F - <<'EOF'\nfix: don't push to main\nEOF",
-    "git commit -m \"$(cat <<'EOF'\nfix: don't push stale refs to main\n\nHandles \"quoted\" names (and merges).\nEOF\n)\"",
+    'git commit -m "fix: guard merges"',
+    "git commit -F - <<'EOF'\nfix: guard merges\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nfix: don't merge stale refs to main\n\nHandles \"quoted\" names (and merges).\nEOF\n)\"",
     "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\n- don't merge until CI is green\nEOF\n)\"",
-    'git commit -m "never run \\`git push origin main\\`"',
     'echo "on $(git branch --show-current)"',
-    "# don't push to main\ngit status",
+    "echo 'gh pr merge 1'",
+    "echo gh pr merge 1",
+    "cat > notes.md <<'EOF'\ngh pr merge 5\nsupabase db reset --linked\nEOF",
     "gh pr view 5",
     "gh pr create --fill",
+    "gh pr list --state open",
+    "gh pr checks 5",
     "gh repo view o/r",
+    "gh run view 123 --log-failed",
     "gh api repos/o/r/pulls/5",
     "gh api repos/o/r/pulls/5/merge",
     "gh api repos/o/r/commits/abc/check-runs",
+    "gh api -X GET repos/o/r/pulls -f state=open",
+    "gh api --method HEAD repos/o/r",
+    "gh api 'repos/{owner}/{repo}/pulls?state=open' --jq '.[].number'",
+    "gh api repos/o/r/rulesets",
     "gh api repos/o/r/pulls -f title=t -f head=feat/x -f base=main",
-    "gh api -X PATCH 'repos/{owner}/{repo}/pulls/5' -f title=x",
-    "gh api -X DELETE repos/o/r/git/refs/heads/feat/x",
-    "gh api repos/o/r/git/refs -f ref=refs/heads/feat/y -f sha=abc",
+    "gh api repositories/123/pulls -f title=t -f head=feat/x -f base=main",
+    "gh api -X PATCH 'repos/{owner}/{repo}/pulls/5' -f title=x -f body='fix base layout'",
+    "gh api repos/o/r/issues/5/comments -f body=hi",
+    "gh api -X POST repos/o/r/pulls/5/comments -f body=x -f commit_id=abc -f path=a -F line=1",
+    "gh api repos/o/r/pulls/5/reviews -f event=COMMENT -f body=x",
+    'gh api repos/o/r/issues/5/comments -f body="$(cat notes.md)"',
     "gh api graphql -f query='query { viewer { login } }'",
     "curl https://example.com",
     "curl -s https://api.github.com/repos/o/r/pulls/1",
+    'curl -s -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/repos/o/r/pulls',
     "curl -sSL https://raw.githubusercontent.com/o/r/main/setup.sh -o /tmp/s.sh",
     "curl -d x=1 https://example.com/form",
+    "curl -fsS -X POST http://localhost:3000/api/items -d '{}'",
+    "curl -X POST https://api.github.com/repos/o/r/issues/5/comments -d '{\"body\":\"x\"}'",
+    "wget -qO- https://api.github.com/repos/o/r",
+    "http GET api.github.com/repos/o/r",
+    "http POST api.github.com/repos/o/r/issues/5/comments body=hi",
+    "curl -s https://api.supabase.com/v1/projects",
     "supabase start",
     "supabase status",
+    "supabase stop",
     "supabase db reset",
     "supabase db push --local",
     "supabase db dump --local -f x.sql",
     "supabase migration new add_table",
-    "supabase migration up",
-    "supabase migration list --linked",
+    "supabase migration list",
+    "supabase migration up --local",
+    "supabase test db",
+    "supabase gen types typescript --local",
+    "npx supabase db reset",
     "psql postgres://localhost:5432/app -c 'select 1'",
+    "psql -h 127.0.0.1 -U postgres -c 'select 1'",
+    "psql postgresql://postgres:postgres@127.0.0.1:54322/postgres -f seed.sql",
+    "psql 'host=localhost dbname=app'",
+    "psql -h /var/run/postgresql app",
+    "psql app",
+    "pg_dump -h localhost app > dump.sql",
+    "DATABASE_URL=postgres://u:p@localhost:5432/app npm test",
     "echo postgresql://x@db.abc.supabase.co",
     "npm test",
     "bash scripts/test.sh",
     "bash -c 'npm test && npm run lint'",
     "GIT_TRACE=1 git status",
+    "$HOME/.local/bin/uv run pytest",
+    "for f in *.py; do python -m py_compile \"$f\"; done",
     "echo 'unclosed",
 ]
 
 
-@pytest.mark.parametrize("cmd", BLOCKED)
+@pytest.mark.parametrize("cmd", BLOCKED + BYPASSES + REFUSED_ON_PURPOSE)
 def test_blocked(fake_git, cmd):
     assert guard.decide(cmd, None), cmd
 
@@ -240,18 +440,23 @@ def test_allowed(fake_git, cmd):
     assert guard.decide(cmd, None) is None, cmd
 
 
+def test_push_hint_names_the_canonical_form(fake_git):
+    assert "git push -u origin HEAD" in guard.decide("git commit -m wip && git push", None)
+
+
 def test_bare_push_on_main_blocked(fake_git):
     fake_git["branch"] = "main"
-    assert guard.decide("git push", None)
-    assert guard.decide("git push origin HEAD", None)
-    assert guard.decide("git push origin @", None)
+    for cmd in ("git push", "git push origin", "git push origin HEAD", "git push -u origin HEAD:refs/heads/main"):
+        assert guard.decide(cmd, None), cmd
     assert guard.decide("git push -u origin feat/new", None) is None
+    assert guard.decide("git push origin HEAD:feat/new", None) is None
 
 
 def test_custom_default_branch(fake_git):
     fake_git["default"] = "develop"
     assert guard.decide("git push origin develop", None)
-    assert guard.decide("gh api -X PATCH repos/o/r/git/refs/heads/develop -f sha=abc", None)
+    assert guard.decide("git push origin HEAD:develop", None)
+    assert guard.decide("git push origin main", None)
 
 
 def test_unknown_branch_refuses_head(fake_git):
@@ -259,6 +464,39 @@ def test_unknown_branch_refuses_head(fake_git):
     assert guard.decide("git push origin HEAD", None)
     assert guard.decide("git push", None)
     assert guard.decide("git push -u origin feat/y", None) is None
+
+
+def test_configured_push_refspec(fake_git):
+    # Sol: a `+` push refspec turns a bare push into a force push; any configured one is refused.
+    fake_git["config"] = "remote.origin.push +HEAD:refs/heads/feat/x"
+    for cmd in ("git push", "git push origin", "git push origin HEAD", "git push origin feat/x"):
+        assert guard.decide(cmd, None), cmd
+    assert guard.decide("git push origin HEAD:feat/x", None) is None
+
+
+def test_push_aliases(fake_git):
+    fake_git["aliases"] = {"p": "push origin main", "sh": "!sh -c 'git push'", "st": "status"}
+    assert guard.decide("git p", None)
+    assert guard.decide("git P", None)
+    assert guard.decide("git status && git sh", None)
+    assert guard.decide("git st", None) is None
+
+
+def test_remote_db_from_environment(fake_git, monkeypatch):
+    monkeypatch.setenv("PGHOST", "db.abc.supabase.co")
+    assert guard.decide("psql -c 'select 1'", None)
+    assert guard.decide("psql -h localhost -c 'select 1'", None) is None
+    monkeypatch.setenv("PGHOST", "localhost")
+    assert guard.decide("psql -c 'select 1'", None) is None
+
+
+def test_pr_patch_reads_input_file(fake_git, tmp_path):
+    (tmp_path / "ok.json").write_text('{"title": "x", "body": "rebase notes"}')
+    (tmp_path / "close.json").write_text('{"state": "closed"}')
+    cmd = "gh api -X PATCH repos/o/r/pulls/5 --input {}"
+    assert guard.decide(cmd.format("ok.json"), str(tmp_path)) is None
+    assert guard.decide(cmd.format("close.json"), str(tmp_path))
+    assert guard.decide(cmd.format("missing.json"), str(tmp_path))
 
 
 # ---------------------------------------------------------------- real repositories
@@ -294,30 +532,33 @@ def make_repo(tmp_path, monkeypatch):
     return make
 
 
-def test_at_resolves_to_current_branch(make_repo):
+def test_head_resolves_to_current_branch(make_repo):
     work = make_repo(branch="main")
-    for cmd in ("git push origin @", "git push origin HEAD", "git push", "git push origin"):
+    for cmd in ("git push origin HEAD", "git push -u origin HEAD", "git push", "git push origin"):
         assert guard.decide(cmd, str(work)), cmd
     git(work, "switch", "-q", "-c", "feat/y")
-    for cmd in ("git push origin @", "git push -u origin HEAD", "git push"):
+    for cmd in ("git push -u origin HEAD", "git push", "git push origin", "git push --force-with-lease origin feat/y"):
         assert guard.decide(cmd, str(work)) is None, cmd
+    git(work, "switch", "-q", "--detach")
+    assert guard.decide("git push origin HEAD", str(work))
+    assert guard.decide("git push origin HEAD:feat/y", str(work))
 
 
-def test_git_C_and_cd_target_the_named_repo(make_repo):
+def test_cd_targets_the_named_repo(make_repo):
     feature = make_repo("feature")
     on_main = make_repo("on-main", branch="main")
-    for cmd in (f"git -C {on_main} push origin HEAD", f"cd {on_main} && git push",
-                f"cd {on_main} && git push origin HEAD", "cd ../on-main && git push origin @",
-                f"(cd {on_main}; git push)"):
+    for cmd in (f"cd {on_main} && git push", f"cd {on_main} && git push origin HEAD",
+                "cd ../on-main && git push -u origin HEAD", f"(cd {on_main}; git push)",
+                f"git -C {on_main} push origin HEAD", f"git -C {feature} push origin HEAD"):
         assert guard.decide(cmd, str(feature)), cmd
-    assert guard.decide(f"git -C {feature} push origin HEAD", str(on_main)) is None
     assert guard.decide(f"cd {feature} && git push -u origin HEAD", str(on_main)) is None
+    assert guard.decide("cd ../feature && git push -u origin HEAD", str(on_main)) is None
 
 
-def test_unknown_directory_refuses_head(make_repo):
+def test_variable_directory_refused(make_repo):
     work = make_repo()
     assert guard.decide("cd $REPO && git push origin HEAD", str(work))
-    assert guard.decide("cd $REPO && git push -u origin feat/y", str(work)) is None
+    assert guard.decide("cd $REPO && git push -u origin feat/y", str(work))
 
 
 def test_default_branch_without_origin_head(make_repo):
@@ -326,15 +567,15 @@ def test_default_branch_without_origin_head(make_repo):
     assert guard.default_branch(str(work)) == "develop"
     assert guard.decide("git push origin develop", str(work))
     assert guard.decide("git push origin HEAD:refs/heads/develop", str(work))
-    assert guard.decide("gh api -X PATCH repos/o/r/git/refs/heads/develop -f sha=abc", str(work))
     assert guard.decide("git push -u origin feat/x", str(work)) is None
 
 
 def test_configured_push_destinations(make_repo):
     work = make_repo()
     git(work, "config", "remote.origin.push", "HEAD:refs/heads/main")
-    assert guard.decide("git push", str(work))
-    assert guard.decide("git push origin", str(work))
+    for cmd in ("git push", "git push origin", "git push origin HEAD"):
+        assert guard.decide(cmd, str(work)), cmd
+    assert guard.decide("git push origin HEAD:feat/x", str(work)) is None
     git(work, "config", "--unset", "remote.origin.push")
     assert guard.decide("git push", str(work)) is None
 
@@ -351,6 +592,17 @@ def test_configured_push_destinations(make_repo):
 
     git(work, "config", "remote.origin.mirror", "true")
     assert guard.decide("git push", str(work))
+    assert guard.decide("git push origin HEAD:feat/x", str(work))
+
+
+def test_push_alias_in_repo_config(make_repo):
+    work = make_repo()
+    git(work, "config", "alias.ship", "push origin HEAD:main")
+    git(work, "config", "alias.run", "!git push")
+    git(work, "config", "alias.co", "checkout")
+    assert guard.decide("git ship", str(work))
+    assert guard.decide("git run", str(work))
+    assert guard.decide("git co feat/x", str(work)) is None
 
 
 def test_hook_outside_cloud_allows(monkeypatch, capsys):
@@ -368,55 +620,3 @@ def test_hook_in_cloud_denies(monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert out["hookSpecificOutput"]["permissionDecisionReason"].startswith("[cloud guard] ")
-
-
-# ---------------------------------------------------------------- branch switches inside one command
-
-SWITCH_THEN_PUSH_BLOCKED = [
-    "git checkout main && git push -u origin HEAD",
-    "git switch main; git push origin @",
-    "git checkout -q main && git push origin HEAD",
-    "git checkout -B main && git push origin HEAD",
-    "git switch -c main origin/main && git push origin HEAD",
-    "git switch --create=main && git push origin HEAD",
-    "git checkout -t origin/main && git push origin HEAD",
-    "git branch -m main && git push origin HEAD",
-    "git branch -M feat/x main && git push origin HEAD",
-    "git symbolic-ref HEAD refs/heads/main && git push origin HEAD",
-    "git checkout --detach && git push origin HEAD",
-    "git checkout - && git push origin HEAD",
-    "git checkout $BRANCH && git push origin HEAD",
-    "gh pr checkout 5 && git push origin HEAD",
-    "git checkout feat/other && git push",
-    "(git checkout main) && git push origin HEAD",
-    "bash -c 'git checkout main && git push -u origin HEAD'",
-]
-
-SWITCH_THEN_PUSH_ALLOWED = [
-    "git checkout -b feat/new && git push -u origin HEAD",
-    "git switch -c fix/y origin/main && git push -u origin HEAD",
-    "git checkout main && git pull && git checkout -b feat/z && git push -u origin HEAD",
-    "git checkout -- README.md && git push -u origin HEAD",
-    "git checkout main -- README.md && git push -u origin HEAD",
-    "git checkout main && git push -u origin feat/x",
-    "git branch -d old && git push -u origin HEAD",
-    "git symbolic-ref HEAD && git push -u origin HEAD",
-]
-
-
-@pytest.mark.parametrize("cmd", SWITCH_THEN_PUSH_BLOCKED)
-def test_switch_then_push_blocked(fake_git, cmd):
-    assert guard.decide(cmd, None), cmd
-
-
-@pytest.mark.parametrize("cmd", SWITCH_THEN_PUSH_ALLOWED)
-def test_switch_then_push_allowed(fake_git, cmd):
-    assert guard.decide(cmd, None) is None, cmd
-
-
-def test_switch_in_another_repo_does_not_move_this_one(make_repo):
-    here = make_repo("here")
-    other = make_repo("other")
-    assert guard.decide(f"git -C {other} checkout main && git push -u origin HEAD", str(here)) is None
-    assert guard.decide(f"cd {other} && git checkout main && git push -u origin HEAD", str(here))
-    assert guard.decide("git checkout main && git push -u origin HEAD", str(here))

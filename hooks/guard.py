@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""PreToolUse guard for Bash in Claude Code cloud sessions.
+"""PreToolUse guard for Bash in Claude Code cloud sessions: a small allowlist.
 
-Blocks the few commands that skip the landing gate or touch production:
-  - git push to the default branch, main or master (any refspec form, --all, --mirror,
-    matching and wildcard refspecs, configured push mappings)
-  - force pushes without --force-with-lease
-  - merging a PR, moving a protected ref or committing to a branch through the API by hand
-    (use `land`)
-  - deleting, archiving, renaming or editing the repository; branch protection and rulesets
-  - Supabase commands against a linked or remote database
+  - git push runs only as its own command:
+      [cd <path> &&] git push [-u|--set-upstream] [-q|--quiet] [--force-with-lease[=<ref>]]
+                              [--force-if-includes] [<remote> [<refspec>]]
+    to a branch other than main, master or the remote's default branch. Any other command
+    that could push (the word `push` next to git, hub, a push alias or a shell expansion) is
+    refused, prose in a commit message included.
+  - GitHub through gh, hub, curl, wget or httpie: reads, plus opening a PR, editing its title
+    or body, and comments and reviews. No merges, ref moves or settings: run `land`.
+  - Databases (psql, pg_dump, pg_restore, pgcli, usql, supabase db/migration): local only.
 
-It is a seatbelt against a model's mistakes, not a sandbox: anyone set on getting around
-it can. GitHub rulesets on the default branch are the server-side boundary; `land` is the
-CI gate. Commands are parsed into words like a shell would (quotes, `&&`, `;`, pipes,
-subshells, `bash -c`, `env`/`timeout`/`sudo` wrappers), so prose such as
-`echo 'gh pr merge'` passes. When a push or API write can't be resolved (a shell variable,
-an unknown directory, `git -c`), the guard refuses it and says what to type instead.
-Outside a cloud session (CLAUDE_CODE_REMOTE != true) it allows everything.
+It is a seatbelt against a model's mistakes, not a sandbox: GitHub rulesets on the default
+branch are the server-side boundary and `land` is the CI gate. When a command can't be read
+for sure (a variable, a substitution, xargs), the guard refuses it and says what to type
+instead. Outside a cloud session (CLAUDE_CODE_REMOTE != true) it allows everything.
 """
 from __future__ import annotations
 
@@ -25,38 +23,38 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
-from typing import NamedTuple
 
 PROTECTED = {"main", "master"}
 LAND_HINT = "Push a feature branch and run `land` (it waits for green CI, then squash-merges)."
-SPELL_OUT = "Spell out the branch, e.g. `git push -u origin HEAD` from your feature branch."
+PUSH_HINT = ("Push as its own command: `git push -u origin HEAD` (add --force-with-lease to force). "
+             "If this was not a push, split it so `push` is not in a git command.")
 DB_HINT = ("Production database changes are not made from cloud sessions. Commit the migration; "
-           "it is applied from Devin's machine with a backup first.")
+           "it is applied from Devin's machine with a backup first. Local runs take --local.")
 REPO_HINT = "Changing or deleting the repository is not done from cloud sessions; ask Devin."
 RULES_HINT = "Branch protection and rulesets are changed by Devin, not from cloud sessions."
+API_HINT = ("From cloud sessions the GitHub API is read-only, apart from opening a PR, editing its "
+            "title or body, and comments and reviews. " + LAND_HINT)
+VAR_HINT = "can't be checked. Spell it out without shell variables, substitutions or xargs."
+UNREADABLE = "Could not read this command safely. Split it into simple commands without nested quoting."
 
-# Words that make an unparseable command worth refusing rather than waving through.
-_RISKY_WORDS = ("push", "merge", "gh api", "curl", "supabase", "refs")
-UNKNOWN_DIR = "/nonexistent/cloud-guard-unknown-dir"
+SENT = "\x00"  # marks an unquoted expansion in a word: its value, even its word count, is unknown
 
+_PUSH_WORD = re.compile(r"\b(?:push|send-pack)\b")
+_GIT_WORD = re.compile(r"\b(?:git|hub)\b")
+_HIDDEN = re.compile(r"[$`\x00]|<<|<\(|>\(|\b(?:eval|xargs|bash|sh|zsh|dash|ksh)\b")
+_RISKY = re.compile(r"\b(?:git|hub|gh|curl|wget|http|https|psql|pg_dump|pg_restore|pgcli|usql|supabase|"
+                    r"postgres|postgresql|PGHOST|DATABASE_URL)\b")
+_EXPANDS = re.compile(r"[$`\x00]")
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_OPS = ("&&", "||", ";;", "|&", ";", "|", "&", "(", ")", "`")
+_OPS = ("&&", "||", ";;", "|&", ";", "|", "&", "(", ")")
 _REDIRS = ("&>>", "&>", ">>", ">&", "<&", ">|", "<<<", "<>", ">", "<")
 _HEREDOC_TAG = re.compile(r"[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([^\s;&|<>()]+))")
-_SHELL_ON_LINE = re.compile(r"(?:^|[\s|;&(/])(?:bash|sh|zsh|dash|ksh)\b(?![.\w-])")
-_KEYWORDS = {"{", "}", "!", "if", "then", "else", "elif", "do", "while", "until"}
+_SHELL_ON_LINE = re.compile(r"(?<![\w.-])(?:bash|sh|zsh|dash|ksh)(?![\w.-])")
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
-_DB_CLIENTS = {"psql", "pg_dump", "pg_dumpall", "pg_restore", "pgcli", "usql"}
-_SUPABASE_HOST = re.compile(r"supabase\.(?:co|com)\b")
-_PG_URL = re.compile(r"^postgres(?:ql)?://\S*supabase\.(?:co|com)")
-_WRITES = {"POST", "PUT", "PATCH", "DELETE"}
-
-
-class Simple(NamedTuple):
-    """One simple command: its words, plus any leading VAR=value assignments."""
-    words: list[str]
-    assigns: list[str]
+# Words skipped to find the command a segment runs.
+_LEADERS = {"env", "sudo", "doas", "nohup", "nice", "ionice", "timeout", "time", "command", "builtin", "exec",
+            "stdbuf", "xargs", "parallel", "npx", "bunx", "pnpx", "export", "declare", "local", "readonly",
+            "{", "}", "!", "if", "then", "else", "elif", "do", "while", "until"}
 
 
 # ---------------------------------------------------------------- git state
@@ -90,7 +88,7 @@ def default_branch(where: str | None, remote: str = "origin") -> str | None:
 
 
 def push_target(where: str | None) -> str | None:
-    """Where a bare `git push` sends the current branch (honors push.default and remote.*.push)."""
+    """Where a bare `git push` sends the current branch (honors push.default=upstream)."""
     out = _git(where, "rev-parse", "--abbrev-ref", "@{push}")
     if not out:
         return None
@@ -104,12 +102,9 @@ def push_config(where: str | None) -> str:
     return _git(where, "config", "--get-regexp", r"^(push\.default|remote\..*\.(push|mirror))$") or ""
 
 
-def protected_for(where: str | None, remote: str | None = None) -> set[str]:
-    names = set(PROTECTED)
-    default = default_branch(where, remote or "origin")
-    if default:
-        names.add(default)
-    return names
+def git_aliases(where: str | None) -> dict[str, str]:
+    out = _git(where, "config", "--get-regexp", r"^alias\.") or ""
+    return {key[6:].lower(): value for key, _, value in (line.partition(" ") for line in out.splitlines())}
 
 
 # ---------------------------------------------------------------- shell parsing
@@ -118,10 +113,11 @@ def protected_for(where: str | None, remote: str | None = None) -> set[str]:
 def tokenize(command: str) -> list[tuple[str, str]]:
     """Split a shell line into ("word" | "op" | "redir" | "heredoc" | "subst", text) tokens.
 
-    Bash-like enough for a seatbelt: quotes, backslashes, comments, operators, redirections
-    and here-documents. A here-document body is dropped unless a shell on that line reads it.
-    A `$(...)` or backquoted command inside double quotes also comes out as a "subst" token
-    holding its body. Raises ValueError on an unclosed quote.
+    Bash-like enough for a seatbelt: quotes (including $'...'), backslashes, comments,
+    operators, redirections and here-documents. A here-document body is dropped unless a
+    shell on that line reads it. Each `$(...)` or backquoted command also comes out as a
+    "subst" token holding its body; an unquoted expansion leaves SENT in its word.
+    Raises ValueError on an unclosed quote.
     """
     toks: list[tuple[str, str]] = []
     word: list[str] = []
@@ -143,12 +139,18 @@ def tokenize(command: str) -> list[tuple[str, str]]:
                 word.append(command[i + 1])
                 in_word = True
             i += 2
-        elif c == "'":
-            j = command.find("'", i + 1)
-            if j < 0:
+        elif c == "'" or command.startswith("$'", i):
+            ansi = c == "$"
+            j = i + 1 + ansi
+            while j < n and command[j] != "'":
+                j += 2 if ansi and command[j] == "\\" else 1
+            if j >= n:
                 raise ValueError("unclosed single quote")
-            word.append(command[i + 1:j])
+            text = command[i + 1 + ansi:j]
+            word.append(text + SENT if ansi and "\\" in text else text)  # escapes can spell any word
             in_word, i = True, j + 1
+        elif command.startswith('$"', i):
+            i += 1  # a translated string reads like "..."
         elif c == '"':
             j, buf = i + 1, []
             while j < n and command[j] != '"':
@@ -167,6 +169,14 @@ def tokenize(command: str) -> list[tuple[str, str]]:
                 raise ValueError("unclosed double quote")
             word.append("".join(buf))
             in_word, i = True, j + 1
+        elif command.startswith("$(", i) or c == "`":
+            end = _subst_end(command, i)
+            toks.append(("subst", command[i + (2 if c == "$" else 1):end - 1]))
+            word.append(command[i:end] + SENT)
+            in_word, i = True, end
+        elif c == "$":
+            word.append("$" + SENT)
+            in_word, i = True, i + 1
         elif c in " \t\r":
             flush()
             i += 1
@@ -256,107 +266,47 @@ def _skip_heredoc_bodies(command: str, i: int, tags: list[str]) -> int:
     return i
 
 
-def segments(command: str, depth: int = 0) -> list[Simple]:
-    """Split a shell line into simple commands, unwrapping `bash -c '...'`, eval and wrappers."""
+def segments(command: str, depth: int = 0) -> list[list[str]]:
+    """The simple commands in a shell line, with those inside substitutions, `bash -c '...'`,
+    `eval`, `env -S` and here-strings fed to a shell."""
     if depth > 4:
         raise ValueError("nested too deeply")
-    out: list[Simple] = []
+    out: list[list[str]] = []
     cur: list[str] = []
-    skip_target = False
+    here: list[str] = []
+    redir = None
     for kind, text in tokenize(command):
         if kind == "op":
-            out.extend(_simple(cur, depth))
-            cur, skip_target = [], False
+            out += _nested(cur, here, depth)
+            cur, here, redir = [], [], None
         elif kind == "redir":
-            skip_target = True
+            redir = text
         elif kind == "subst":
-            out.extend(segments(text, depth + 1))
+            out += segments(text, depth + 1)
         elif kind == "word":
-            if skip_target:
-                skip_target = False
-            else:
+            if redir is None:
                 cur.append(text)
-    out.extend(_simple(cur, depth))
+            elif redir == "<<<":
+                here.append(text)
+            redir = None
+    return out + _nested(cur, here, depth)
+
+
+def _nested(words: list[str], here: list[str], depth: int) -> list[list[str]]:
+    if not words:
+        return []
+    out = [words]
+    names = [os.path.basename(w) for w in words]
+    if any(n in _SHELLS for n in names):
+        script = _shell_script(words[next(k for k, n in enumerate(names) if n in _SHELLS) + 1:])
+        for text in here + ([script] if script is not None else []):
+            out += segments(text, depth + 1)
+    if "eval" in names:
+        out += segments(" ".join(words[names.index("eval") + 1:]), depth + 1)
+    if "env" in names and ("-S" in words or "--split-string" in words):
+        k = words.index("-S") if "-S" in words else words.index("--split-string")
+        out += segments(" ".join(words[k + 1:]), depth + 1)
     return out
-
-
-def _simple(words: list[str], depth: int) -> list[Simple]:
-    while words and words[0] in _KEYWORDS:
-        words = words[1:]
-    return unwrap(words, depth) if words else []
-
-
-def _skip_opts(args: list[str], with_value: frozenset[str] = frozenset(),
-               assigns: bool = False, positional: int = 0) -> list[str]:
-    """Drop leading options (and the values of options in with_value), then `positional` words."""
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            i += 1
-            break
-        if a.startswith("-") and len(a) > 1:
-            i += 2 if a in with_value else 1
-        elif assigns and _ASSIGN.match(a):
-            i += 1
-        else:
-            break
-    return args[i + positional:]
-
-
-def _wrapper(with_value: str = "", assigns: bool = False, positional: int = 0) -> Callable[[list[str]], list[str]]:
-    opts = frozenset(with_value.split())
-    return lambda args: _skip_opts(args, opts, assigns, positional)
-
-
-# Commands that run another command: how to find it.
-WRAPPERS: dict[str, Callable[[list[str]], list[str]]] = {
-    "env": _wrapper("-u --unset -C --chdir -P", assigns=True),
-    "timeout": _wrapper("-s --signal -k --kill-after", positional=1),
-    "nice": _wrapper("-n --adjustment"),
-    "ionice": _wrapper("-c --class -n --classdata -p --pid -P --pgid -u --uid"),
-    "nohup": _wrapper(),
-    "command": _wrapper(),
-    "exec": _wrapper("-a"),
-    "time": _wrapper("-f --format -o --output"),
-    "sudo": _wrapper("-u --user -g --group -C --close-from -D --chdir -h --host -p --prompt "
-                     "-r --role -t --type -U --other-user -T --command-timeout", assigns=True),
-    "doas": _wrapper("-u -C"),
-    "stdbuf": _wrapper("-i -o -e --input --output --error"),
-    "npx": _wrapper("-p --package"),
-    "bunx": _wrapper("-p --package"),
-    "pnpx": _wrapper("-p --package"),
-}
-_XARGS = frozenset("-I -L -n -P -s -d -E -a -e -i --max-args --max-procs --delimiter --arg-file".split())
-
-
-def unwrap(words: list[str], depth: int = 0) -> list[Simple]:
-    assigns: list[str] = []
-    while words:
-        if _ASSIGN.match(words[0]):
-            assigns.append(words[0])
-            words = words[1:]
-            continue
-        head = os.path.basename(words[0])
-        if head in _SHELLS:
-            script = _shell_script(words[1:])
-            return segments(script, depth + 1) if script is not None else [Simple(words, assigns)]
-        if head == "eval":
-            return segments(" ".join(words[1:]), depth + 1)
-        if head == "env" and any(a in ("-S", "--split-string") or a.startswith("--split-string=") for a in words[1:]):
-            return segments(" ".join(_skip_opts(words[1:], frozenset({"-u", "--unset", "-C", "--chdir"}), True)), depth + 1)
-        if head == "xargs":
-            # xargs appends words we can't see; the `$` marker makes push checks refuse to guess.
-            words = _skip_opts(words[1:], _XARGS) + ["${xargs}"]
-            continue
-        if head in ("pnpm", "yarn", "npm", "bun") and len(words) > 1 and words[1] in ("dlx", "exec", "x"):
-            words = _skip_opts(words[2:], frozenset({"-p", "--package"}))
-            continue
-        skip = WRAPPERS.get(head)
-        if skip is None:
-            break
-        words = skip(words[1:])
-    return [Simple(words, assigns)] if words else []
 
 
 def _shell_script(args: list[str]) -> str | None:
@@ -370,316 +320,10 @@ def _shell_script(args: list[str]) -> str | None:
             i += 1
         elif a.startswith(("-", "+")) and len(a) > 1:
             if "c" in a[1:]:
-                rest = _skip_opts(args[i + 1:], frozenset({"-o", "+o", "-O", "+O"}))
-                return rest[0] if rest else ""
+                return args[i + 1] if i + 1 < len(args) else ""
             i += 1
         else:
             return None
-    return None
-
-
-# ---------------------------------------------------------------- checks
-
-
-def _is_var(text: str) -> bool:
-    return any(c in text for c in "$`{}*%<>") or text == ""
-
-
-def _join(here: str | None, path: str) -> str:
-    if _is_var(path) or path == "-":
-        return UNKNOWN_DIR
-    return os.path.join(here or os.getcwd(), os.path.expanduser(path))
-
-
-def _chdir(here: str | None, args: list[str]) -> str:
-    args = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
-    return _join(here, args[0]) if args else os.path.expanduser("~")
-
-
-def ref_branch(ref: str, branch: str | None) -> str | None:
-    """Branch name a push refspec side names; None when it is HEAD and HEAD is unknown."""
-    if ref in ("HEAD", "@"):
-        return branch
-    for prefix in ("refs/heads/", "heads/"):
-        if ref.startswith(prefix):
-            return ref[len(prefix):]
-    return ref
-
-
-KEEP = object()  # HEAD did not move
-
-
-def _repo_key(where: str | None) -> str:
-    return _git(where, "rev-parse", "--show-toplevel") or os.path.normpath(where or os.getcwd())
-
-
-def head_after(sub: str, args: list[str]):
-    """Branch HEAD names after `git <sub> <args>`: KEEP if HEAD does not move, None if unknown."""
-    if any("$" in a or "`" in a for a in args):
-        return None
-    flags = [a for a in args if a.startswith("-")]
-    plain = [a for a in args if not a.startswith("-")]
-    if sub == "branch":
-        if not any(f in ("-m", "-M", "--move") for f in flags):
-            return KEEP
-        return plain[0] if len(plain) == 1 else None
-    if sub == "symbolic-ref":
-        if any(f in ("-d", "--delete") for f in flags):
-            return None
-        return ref_branch(plain[1], None) if plain[:1] == ["HEAD"] and len(plain) > 1 else KEEP
-    if sub == "bisect":
-        return None if plain[:1] in (["start"], ["reset"]) else KEEP
-    # checkout / switch
-    if sub == "checkout" and "--" in args:
-        return KEEP  # `git checkout [<tree-ish>] -- <paths>` restores files
-    create, track, detach, rest, i = None, False, False, [], 0
-    while i < len(args):
-        a = args[i]
-        i += 1
-        if a in ("-b", "-B", "-c", "-C", "--create", "--force-create", "--orphan"):
-            create = args[i] if i < len(args) else None
-            i += 1
-        elif a.startswith(("--create=", "--force-create=", "--orphan=")):
-            create = a.split("=", 1)[1]
-        elif a in ("-d", "--detach"):
-            detach = True
-        elif a == "-t" or a.startswith("--track"):
-            track = True
-        elif a == "-" or not a.startswith("-"):
-            rest.append(a)  # a lone "-" is the previous branch, not a flag
-    if create:
-        return create
-    if detach:
-        return None
-    if not rest:
-        return None if track else KEEP
-    if sub == "checkout" and len(rest) > 1:
-        return KEEP  # `git checkout <tree-ish> <paths>`
-    target = rest[0]
-    if target == "-" or target.startswith("@{"):
-        return None
-    return target.split("/", 1)[1] if track and "/" in target else target
-
-
-def check_git(cmd: Simple, here: str | None, moved: dict[str, object] | None = None) -> str | None:
-    moved = {} if moved is None else moved
-    words = cmd.words
-    if os.path.basename(words[0]) != "git":
-        return None
-    where, config, i = here, False, 1
-    while i < len(words):
-        w = words[i]
-        if w == "-C" and i + 1 < len(words):
-            where = _join(where, words[i + 1])
-            i += 2
-        elif w in ("-c", "--config-env"):
-            config = True
-            i += 2
-        elif w.startswith("--config-env="):
-            config = True
-            i += 1
-        elif w in ("--git-dir", "--work-tree", "--namespace", "--super-prefix") and i + 1 < len(words):
-            if w == "--git-dir":
-                where = _join(where, words[i + 1])
-            i += 2
-        elif w.startswith("--git-dir="):
-            where = _join(where, w.split("=", 1)[1])
-            i += 1
-        elif w.startswith("-"):
-            i += 1
-        else:
-            break
-    if i >= len(words):
-        return None
-    if words[i] in ("checkout", "switch", "branch", "symbolic-ref", "bisect"):
-        head = head_after(words[i], words[i + 1:])
-        if head is not KEEP:
-            moved[_repo_key(where)] = head
-        return None
-    if words[i] != "push":
-        return None
-    if config or any(a.startswith("GIT_CONFIG") for a in cmd.assigns):
-        return ("`git -c ... push` can change where the push goes. Drop the -c option and push your "
-                "feature branch: `git push -u origin HEAD`.")
-    return check_push(words[i + 1:], where, moved.get(_repo_key(where), KEEP) if moved else KEEP)
-
-
-_PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
-
-
-def check_push(args: list[str], where: str | None, head: object = KEEP) -> str | None:
-    """head: the branch an earlier command in the same line switched to (None if unknown)."""
-    force_all = delete = lease_all = False
-    leased: set[str] = set()
-    positional: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        i += 1
-        if "$" in a or "`" in a:
-            return f"`git push` with a shell variable or substitution (`{a}`) can't be checked. {SPELL_OUT}"
-        if a == "--":
-            positional.extend(args[i:])
-            break
-        if a in ("--all", "--branches", "--mirror"):
-            return f"`git push {a}` would update the default branch. {LAND_HINT}"
-        if a == "--force":
-            force_all = True
-        elif a == "--force-with-lease":
-            lease_all = True
-        elif a.startswith("--force-with-lease="):
-            leased.add(ref_branch(a.split("=", 1)[1].split(":", 1)[0], None) or "")
-        elif a == "--no-force-with-lease":
-            lease_all = False
-            leased.clear()
-        elif a == "--delete":
-            delete = True
-        elif a in _PUSH_VALUE_OPTS:
-            i += 1
-        elif a.startswith("--"):
-            continue
-        elif a.startswith("-") and len(a) > 1:
-            for j, c in enumerate(a[1:], start=2):
-                if c == "f":
-                    force_all = True
-                elif c == "d":
-                    delete = True
-                elif c == "o":  # -o <option> takes the rest of the cluster or the next word
-                    i += 1 if j == len(a) else 0
-                    break
-        else:
-            positional.append(a)
-
-    remote = positional[0] if positional else None
-    specs = positional[1:]
-    branch = current_branch(where) if head is KEEP else head
-    protected = protected_for(where, remote)
-    if force_all:
-        # --force disables the lease checks too (git-push(1)), so a lease does not make it safe.
-        return "Force push without a lease is blocked. Use `git push --force-with-lease` on your feature branch."
-    if not specs:
-        if delete:
-            return None
-        if head is not KEEP:
-            return ("A bare `git push` after switching branches in the same command can't be checked. "
-                    "Push as its own command, or name the branch: `git push -u origin HEAD`.")
-        return _check_default_push(where, branch, protected)
-    for spec in specs:
-        forced = spec.startswith("+")
-        spec = spec.removeprefix("+")
-        if spec in ("", ":") or "*" in spec:
-            return (f"`git push {remote} {spec or ':'}` pushes many branches at once, including the "
-                    f"default branch. {LAND_HINT}")
-        if spec.startswith("^"):
-            continue  # negative refspec: excludes, never pushes
-        src, colon, dst = spec.partition(":")
-        if delete or (colon and not src):
-            name = ref_branch(dst if colon else src, branch)
-            if name is None or name in protected:
-                return f"Deleting `{name or spec}` is blocked in cloud sessions."
-            continue
-        name = ref_branch(dst or src, branch)
-        if name is None:
-            return f"Could not tell which branch `{spec}` pushes to (no branch checked out here). {SPELL_OUT}"
-        if name in protected:
-            return f"Pushing to `{name}` is blocked in cloud sessions. {LAND_HINT}"
-        if forced and not (lease_all or name in leased):
-            return "Force push without a lease is blocked. Use `git push --force-with-lease` on your feature branch."
-    return None
-
-
-def _check_default_push(where: str | None, branch: str | None, protected: set[str]) -> str | None:
-    """A push with no refspec: the current branch, unless config says otherwise."""
-    for line in push_config(where).splitlines():
-        key, _, value = line.partition(" ")
-        if key == "push.default" and value == "matching":
-            return f"push.default=matching pushes every branch, including the default branch. {SPELL_OUT}"
-        if key.endswith(".mirror") and value.lower() in ("true", "1", "yes", "on"):
-            return f"This remote is configured as a mirror; a push would update the default branch. {LAND_HINT}"
-        if key.endswith(".push"):
-            spec = value.removeprefix("+")
-            dst = spec.partition(":")[2] or spec.partition(":")[0]
-            name = ref_branch(dst, branch)
-            if spec in ("", ":") or "*" in spec or name is None or name in protected:
-                return f"The configured push refspec `{value}` can update the default branch. {SPELL_OUT}"
-    if branch is None:
-        return f"Could not tell which branch a bare `git push` would update here. {SPELL_OUT}"
-    target = push_target(where) or branch
-    for name in (branch, target):
-        if name in protected:
-            return f"Pushing to `{name}` is blocked in cloud sessions. {LAND_HINT}"
-    return None
-
-
-def _api_path(endpoint: str) -> list[str]:
-    segs = [s for s in endpoint.split("://", 1)[-1].split("?", 1)[0].split("/") if s]
-    if segs and "." in segs[0]:  # a host; curl also takes api.github.com/... without a scheme
-        segs = segs[1:]
-    if segs[:2] == ["api", "v3"]:  # GitHub Enterprise
-        segs = segs[2:]
-    return segs
-
-
-def check_api(method: str, endpoint: str, body: list[str], where: str | None) -> str | None:
-    """A REST or GraphQL call to GitHub with a write method."""
-    method = method.upper()
-    if method not in _WRITES:
-        return None
-    segs = _api_path(endpoint)
-    if not segs or _is_var(segs[0]):
-        return f"Writing to an API path held in a variable (`{endpoint}`) can't be checked. Spell out the path."
-    if segs[0] == "graphql":
-        text = " ".join(body)
-        if re.search(r"\bmutation\b", text) and re.search(
-                r"merge|updateRefs?|deleteRef|createRef|BranchProtection|Ruleset|archiveRepository|"
-                r"deleteRepository|updateRepository|transferRepository", text, re.IGNORECASE):
-            return f"This GraphQL mutation merges or changes protected state by hand. {LAND_HINT}"
-        return None
-    if "rulesets" in segs:
-        return RULES_HINT
-    if segs[0] != "repos" or len(segs) < 2:
-        return None
-    rest = segs[1:]
-    tails = [rest[2:]] if len(rest) >= 2 else []
-    if _is_var(rest[0]) and not (len(rest) > 1 and _is_var(rest[1])):
-        tails.append(rest[1:])  # one variable may hold owner/repo, as in repos/$NWO/...
-    for tail in tails:
-        reason = _check_repo_call(method, endpoint, tail, " ".join(body), where)
-        if reason:
-            return reason
-    return None
-
-
-def _check_repo_call(method: str, endpoint: str, tail: list[str], text: str, where: str | None) -> str | None:
-    """`tail` is the path after repos/<owner>/<repo>."""
-    if not tail:
-        return REPO_HINT if method in ("PATCH", "DELETE") else None
-    head = tail[0]
-    if _is_var(head):
-        return f"Writing to `{endpoint}` can't be checked (a variable in the path). Spell out the path."
-    if head == "pulls" and len(tail) >= 3 and tail[2] == "merge":
-        return f"Merging through the API by hand skips the CI gate. {LAND_HINT}"
-    if head in ("merges", "merge-upstream"):
-        return f"Direct branch merges through the API are blocked. {LAND_HINT}"
-    if head == "transfer":
-        return REPO_HINT
-    if head == "contents" and method in ("PUT", "DELETE"):
-        return f"Committing through the contents API writes straight to a branch. Commit with git. {LAND_HINT}"
-    if head == "branches" and ("protection" in tail or tail[-1] == "rename"):
-        return RULES_HINT
-    if head == "git" and tail[1:2] == ["refs"]:
-        ref = "/".join(tail[2:])
-        protected = protected_for(where)
-        if not ref:
-            names = re.findall(r"refs/heads/([^\s\"',}]+)", text)
-            if method == "POST" and names and not any(_is_var(n) or n in protected for n in names):
-                return None
-            return f"Creating or moving a protected branch through the API is blocked. {LAND_HINT}"
-        if _is_var(ref):
-            return f"Writing to `{endpoint}` can't be checked (a variable in the ref). Spell out the branch."
-        name = ref.removeprefix("heads/") if ref.startswith("heads/") else None
-        if name is not None and (_is_var(name) or name in protected):
-            return f"Moving `{name}` through the API is blocked. {LAND_HINT}"
     return None
 
 
@@ -717,141 +361,415 @@ def _non_flags(args: list[str], with_value: set[str]) -> list[str]:
     return [word for flag, word in _options(args, with_value) if flag is None]
 
 
-_GH_API_VALUE = {"-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header", "--input",
-                 "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview"}
-_GH_FIELDS = {"-f", "-F", "--field", "--raw-field", "--input"}
+# ---------------------------------------------------------------- git push
 
 
-def check_gh(words: list[str], where: str | None) -> str | None:
-    if os.path.basename(words[0]) != "gh":
+_PUSH_FLAGS = {"-u", "--set-upstream", "-q", "--quiet", "--force-with-lease", "--force-if-includes"}
+_BRANCH = re.compile(r"(?!(?:refs|heads|remotes|tags)/)[A-Za-z0-9_][\w./-]*")
+
+
+def _is_branch(name: str) -> bool:
+    return bool(_BRANCH.fullmatch(name)) and name != "HEAD" and not re.search(r"\.\.|//|/\.|\.lock$|[/.]$", name)
+
+
+def push_form(command: str) -> tuple[str | None, list[str]] | None:
+    """(cd path or None, push arguments) when the whole command is one plain `git push`."""
+    if re.search(r"[$`<]|>\(", command):
         return None
-    sub = _non_flags(words[1:], {"-R", "--repo", "--hostname"})
-    if sub[:2] == ["pr", "merge"]:
-        return f"Merging by hand skips the CI gate. {LAND_HINT}"
-    if sub[:1] == ["repo"] and sub[1:2] and sub[1] in ("delete", "archive", "rename", "edit"):
-        return REPO_HINT
-    if sub[:1] != ["api"]:
-        return None
-    method, endpoint, body = None, None, []
-    for flag, value in _options(words[words.index("api") + 1:], _GH_API_VALUE):
-        if flag in ("-X", "--method"):
-            method = value
-        elif flag in _GH_FIELDS:
-            body.append(_field_text(value, flag, where))
-        elif flag is None and endpoint is None:
-            endpoint = value
-    if endpoint is None:
-        return None
-    return check_api(method or ("POST" if body else "GET"), endpoint, body, where)
-
-
-def _field_text(value: str, flag: str, where: str | None) -> str:
-    """The body text a field or --input carries; for --input, the file's contents when readable."""
-    if flag != "--input" or value == "-":
-        return value
     try:
-        with open(os.path.join(where or os.getcwd(), value), encoding="utf-8") as fh:
-            return fh.read(65536)
-    except OSError:
-        return value
-
-
-_CURL_DATA = {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json",
-              "-F", "--form", "--form-string"}
-_CURL_UPLOAD = {"-T", "--upload-file"}
-_CURL_VALUE = {"-X", "--request", "-H", "--header", "-o", "--output", "-u", "--user", "-A", "--user-agent",
-               "-e", "--referer", "-b", "--cookie", "-c", "--cookie-jar", "-K", "--config", "--url",
-               "-w", "--write-out", "-m", "--max-time", "--connect-timeout", "-x", "--proxy", "--retry",
-               "-r", "--range", "-E", "--cert", "--cacert", "--key", "--oauth2-bearer", "--resolve",
-               "--connect-to", "-D", "--dump-header"} | _CURL_DATA | _CURL_UPLOAD
-
-
-def check_curl(words: list[str], where: str | None) -> str | None:
-    if os.path.basename(words[0]) != "curl":
+        toks = tokenize(command.strip())
+    except ValueError:
         return None
-    method, urls, body, upload, get = None, [], [], False, False
-    for flag, value in _options(words[1:], _CURL_VALUE):
-        if flag in ("-X", "--request"):
-            method = value
-        elif flag in _CURL_DATA:
-            body.append(value)
-        elif flag in _CURL_UPLOAD:
-            upload = True
-        elif flag in ("--url", None):
-            urls.append(value)
-        elif flag in ("-G", "--get"):
-            get = True
-    if method is None:
-        method = "PUT" if upload else ("POST" if body and not get else "GET")
+    cd = None
+    if len(toks) > 3 and toks[0] == ("word", "cd") and toks[1][0] == "word" and toks[2] == ("op", "&&"):
+        cd, toks = toks[1][1], toks[3:]
+    if any(kind != "word" for kind, _ in toks) or [t for _, t in toks[:2]] != ["git", "push"]:
+        return None
+    return cd, [t for _, t in toks[2:]]
+
+
+def check_push(args: list[str], where: str | None) -> str | None:
+    positional = []
+    for a in args:
+        if not a.startswith("-"):
+            positional.append(a)
+        elif a not in _PUSH_FLAGS and not a.startswith("--force-with-lease="):
+            return f"`git push {a}` is not allowed in cloud sessions. {PUSH_HINT}"
+    if len(positional) > 2:
+        return f"Push one branch at a time. {PUSH_HINT}"
+    remote, spec = (positional + [None, None])[:2]
+    if remote is not None and not re.fullmatch(r"[A-Za-z0-9_][\w.-]*", remote):
+        return f"Push to a named remote such as `origin`, not `{remote}`."
+    config = push_config(where)
+    if re.search(r"^remote\.\S*\.mirror (?:true|1|yes|on)$", config, re.MULTILINE | re.IGNORECASE):
+        return f"This remote is configured as a mirror; a push would update the default branch. {LAND_HINT}"
+    branch = current_branch(where)
+    unknown = ("Could not tell which branch this push updates (detached HEAD or no repository here). "
+               "Name it: `git push -u origin <branch>`.")
+    configured = re.search(r"^remote\.\S*\.push ", config, re.MULTILINE)
+    if spec is None:
+        if configured or re.search(r"^push\.default matching$", config, re.MULTILINE | re.IGNORECASE):
+            return "This repo's push config can send a bare push elsewhere. Push `HEAD:<branch>` explicitly."
+        if branch is None:
+            return unknown
+        targets = {branch, push_target(where) or branch}
+    else:
+        src, colon, dst = spec.partition(":")
+        if src == "HEAD" and branch is None:
+            return unknown
+        if not (src == "HEAD" or _is_branch(src)):
+            return f"Push refspec `{spec}` is not allowed. Use HEAD, <branch> or HEAD:<branch>."
+        if colon:
+            dst = dst[len("refs/heads/"):] if src == "HEAD" and dst.startswith("refs/heads/") else dst
+            if not _is_branch(dst):
+                return f"Push refspec `{spec}` is not allowed. Use HEAD, <branch> or HEAD:<branch>."
+            targets = {dst}
+        elif configured:
+            return f"A configured remote.*.push can redirect `{spec}`. Push `HEAD:<branch>` explicitly."
+        else:
+            targets = {branch if src == "HEAD" else src}
+    protected = {name.lower() for name in PROTECTED | {default_branch(where, remote or "origin") or "main"}}
+    for name in targets:
+        if name.lower() in protected:
+            return f"Pushing to `{name}` is blocked in cloud sessions. {LAND_HINT}"
+    return None
+
+
+def could_push(command: str, flat: str) -> bool:
+    for text in (command, flat):
+        text = re.sub(r"\bstash\s+push\b", "stash", text)
+        if _PUSH_WORD.search(text) and (_GIT_WORD.search(text) or _HIDDEN.search(text)):
+            return True
+    return False
+
+
+def check_aliases(segs: list[list[str]], where: str | None) -> str | None:
+    """A git alias that pushes or runs a shell (`!...`) hides what it does."""
+    gits = [words for words in segs if any(os.path.basename(w) == "git" for w in words)]
+    if not gits:
+        return None
+    risky = {name for name, value in git_aliases(where).items()
+             if _PUSH_WORD.search(value) or value.lstrip().startswith("!")}
+    for words in gits:
+        hit = next((w for w in words if w.lower() in risky), None)
+        if hit:
+            return f"`git {hit}` is an alias that can push or run a shell. {PUSH_HINT}"
+    return None
+
+
+# ---------------------------------------------------------------- GitHub
+
+
+_O, _R = r"(?:[\w.-]+|\{owner\})", r"(?:[\w.-]+|\{repo\})"
+_REPO = rf"(?:repos/{_O}/{_R}|repositories/\d+)"
+_WRITE_OK = [("POST", re.compile(rf"{_REPO}/pulls")),
+             ("PATCH", re.compile(rf"{_REPO}/pulls/\d+")),
+             ("POST", re.compile(rf"{_REPO}/(?:issues|pulls)/\d+/comments")),
+             ("POST", re.compile(rf"{_REPO}/pulls/\d+/reviews"))]
+_STATE_BASE = re.compile(r"^\s*(?:state|base)\b|[\"'](?:state|base)[\"']\s*:|[&?](?:state|base)=")
+
+
+def _body(text: str, cwd: str | None) -> str | None:
+    """A request body or field; a file it names (`@file`, `key=@file`) is read. None if unreadable."""
+    key, eq, value = text.partition("=")
+    name = value if eq and value.startswith("@") else text if text.startswith("@") else None
+    if name is None:
+        return text
+    try:
+        with open(os.path.join(cwd or os.getcwd(), name[1:]), encoding="utf-8") as fh:
+            return (key + "=" if eq else "") + fh.read(65536)
+    except (OSError, ValueError):
+        return None
+
+
+def check_github_write(method: str, path: str, bodies: list[str], cwd: str | None) -> str | None:
+    """Reads pass; writes only from _WRITE_OK, with PR state and base left to `land`."""
+    if method in ("GET", "HEAD"):
+        return None
+    if not re.fullmatch(r"[A-Z]+", method):
+        return f"An API method held in a variable {VAR_HINT}"
+    path = path[1:] if path.startswith("/") else path
+    if re.search(r"[%\\#$`\x00]|//|\.\.", path) or "." in path.split("?")[0].split("/"):
+        return f"The API path `{path.replace(SENT, '')}` is not plain (no %, #, \\, .., //, . segments or variables)."
+    texts = [_body(b, cwd) for b in bodies]
+    if path == "graphql" and method == "POST":
+        if all(t is not None and not re.search(r"\bmutation\b", t, re.IGNORECASE) for t in texts):
+            return None
+        return f"GraphQL mutations are not run from cloud sessions. {LAND_HINT}"
+    if not any(m == method and rx.fullmatch(path) for m, rx in _WRITE_OK):
+        if path.endswith("/merge") or "/merges" in path:
+            return f"Merging by hand skips the CI gate. {LAND_HINT}"
+        return RULES_HINT if re.search(r"/protection|rulesets", path) else f"`{method} {path}`: {API_HINT}"
+    if method == "PATCH" and any(t is None or _STATE_BASE.search(t) for t in texts):
+        return f"Changing a PR's state or base by hand is not done from cloud sessions. {LAND_HINT}"
+    return None
+
+
+def _split_url(url: str) -> tuple[str | None, str]:
+    rest = url.split("://", 1)[1] if "://" in url else url
+    host, _, path = rest.partition("/")
+    host = re.sub(r":\d*$", "", host.rpartition("@")[2].split("?")[0].lower())
+    return (None if _EXPANDS.search(host) or not host and not path else host), path
+
+
+def _check_http(method: str, urls: list[str], bodies: list[str], cwd: str | None) -> str | None:
+    write = method not in ("GET", "HEAD")
     for url in urls:
-        if "api.github.com" in url.lower() or "repos/" in url or url.rstrip("/").endswith("graphql"):
-            reason = check_api(method, url, body, where)
+        host, path = _split_url(url)
+        if host is None:
+            if write:
+                return f"A write to a URL held in a variable {VAR_HINT}"
+        elif host == "api.supabase.com" or host.endswith(".supabase.co"):
+            if write or re.search(r"/database/(?:query|migrations)", "/" + path):
+                return DB_HINT
+        elif host == "github.com" or host.endswith(".github.com"):
+            reason = write and check_github_write(method, path, bodies, cwd)
             if reason:
                 return reason
     return None
 
 
-def _supabase_command(args: list[str]) -> tuple[str | None, str | None]:
-    values = {"-s", "--schema", "-p", "--password", "-f", "--file", "--workdir", "--project-ref",
-              "--version", "-o", "--output", "--db-url", "--status"}
-    for i, a in enumerate(args):
-        if a in ("db", "migration", "migrations"):
-            rest = _non_flags(args[i + 1:], values)
-            return a, rest[0] if rest else None
-    return None, None
+def _method(methods: list[str], args: list[str], default: str) -> str:
+    if any(SENT in a for a in args):
+        return "?"  # an unquoted expansion may hold -X PUT
+    return methods[-1].upper() if methods else default
 
 
-def check_database(cmd: Simple) -> str | None:
-    words = cmd.words
-    head = os.path.basename(words[0]).split("@", 1)[0]
-    if head in ("pnpm", "yarn", "bun") and len(words) > 1 and words[1].split("@", 1)[0] == "supabase":
-        words, head = words[1:], "supabase"
-    if head == "supabase":
-        args = words[1:]
-        local, linked = "--local" in args, "--linked" in args
-        if any(a == "--db-url" or a.startswith("--db-url=") for a in args):
-            return DB_HINT
-        group, action = _supabase_command(args)
-        if group == "db" and action in ("push", "pull", "dump") and not local:
-            return DB_HINT
-        if group in ("migration", "migrations") and action in ("repair", "fetch") and not local:
-            return DB_HINT
-        if linked and ((group == "db" and action == "reset")
-                       or (group in ("migration", "migrations") and action in ("up", "down"))):
-            return DB_HINT
+_GH_API_VALUE = {"-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header", "--input",
+                 "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview", "-d", "--data"}
+
+
+def check_gh(args: list[str], cwd: str | None) -> str | None:
+    sub = _non_flags(args, {"-R", "--repo", "--hostname"})[:2]
+    if any(_EXPANDS.search(w) for w in sub):
+        return f"A gh subcommand held in a variable {VAR_HINT}"
+    if sub == ["pr", "merge"]:
+        return f"Merging by hand skips the CI gate. {LAND_HINT}"
+    if sub[:1] == ["repo"] and sub[1:] and sub[1] in ("delete", "archive", "rename", "edit", "sync"):
+        return REPO_HINT
+    if sub[:1] == ["ruleset"]:
+        return RULES_HINT
+    if sub[:1] == ["alias"] and sub[1:] and sub[1] in ("set", "import"):
+        return "gh aliases can hide a merge; run the gh command itself."
+    if sub[:1] != ["api"]:
         return None
-    if head in _DB_CLIENTS and any(_SUPABASE_HOST.search(w) for w in words[1:] + cmd.assigns):
-        return "Direct connections to a Supabase database are not made from cloud sessions."
-    values = words[1:] + [a.split("=", 1)[1] for a in cmd.assigns]
-    if head not in ("echo", "printf") and any(_PG_URL.match(v) for v in values):
-        return "Direct connections to a Supabase database are not made from cloud sessions."
+    methods, endpoint, bodies = [], None, []
+    for flag, value in _options(args[args.index("api") + 1:], _GH_API_VALUE):
+        if flag in ("-X", "--method"):
+            methods.append(value)
+        elif flag in ("-f", "-F", "--field", "--raw-field", "-d", "--data"):
+            bodies.append(value)
+        elif flag == "--input":
+            bodies.append("@" + value)
+        elif flag is None and endpoint is None:
+            endpoint = value
+    if endpoint is None:
+        return None
+    method = _method(methods, args, "POST" if bodies else "GET")
+    path = endpoint.split("://", 1)[1].partition("/")[2] if "://" in endpoint else endpoint
+    return check_github_write(method, path, bodies, cwd)
+
+
+_CURL_DATA = {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json",
+              "-F", "--form", "--form-string"}
+_CURL_VALUE = {"-X", "--request", "-H", "--header", "-o", "--output", "-u", "--user", "-A", "--user-agent",
+               "-e", "--referer", "-b", "--cookie", "-c", "--cookie-jar", "-K", "--config", "--url",
+               "-w", "--write-out", "-m", "--max-time", "--connect-timeout", "-x", "--proxy", "--retry",
+               "-r", "--range", "-E", "--cert", "--cacert", "--key", "--oauth2-bearer", "--resolve",
+               "--connect-to", "-D", "--dump-header", "-T", "--upload-file"} | _CURL_DATA
+
+
+def check_curl(args: list[str], cwd: str | None) -> str | None:
+    methods, urls, bodies, upload, get = [], [], [], False, False
+    for flag, value in _options(args, _CURL_VALUE):
+        if flag in ("-X", "--request"):
+            methods.append(value)
+        elif flag in _CURL_DATA:
+            bodies.append(value)
+        elif flag in ("-T", "--upload-file"):
+            upload = True
+        elif flag in ("-K", "--config"):
+            return "`curl -K` reads its URL and method from a file. Put them on the command line."
+        elif flag in ("-G", "--get"):
+            get = True
+        elif flag in (None, "--url"):
+            urls.append(value)
+    method = _method(methods, args, "PUT" if upload else "POST" if bodies and not get else "GET")
+    return _check_http(method, urls, bodies, cwd)
+
+
+_WGET_VALUE = {"-O", "--output-document", "-o", "--output-file", "-a", "--append-output", "-i", "--input-file",
+               "-P", "--directory-prefix", "-U", "--user-agent", "--header", "--user", "--password", "-t",
+               "--tries", "-T", "--timeout", "-w", "--wait", "-e", "--execute", "--method", "--post-data",
+               "--post-file", "--body-data", "--body-file", "-B", "--base"}
+
+
+def check_wget(args: list[str], cwd: str | None) -> str | None:
+    methods, urls, bodies = [], [], []
+    for flag, value in _options(args, _WGET_VALUE):
+        if flag == "--method":
+            methods.append(value)
+        elif flag in ("--post-data", "--body-data"):
+            bodies.append(value)
+        elif flag in ("--post-file", "--body-file"):
+            bodies.append("@" + value)
+        elif flag in ("-i", "--input-file"):
+            urls.append(SENT)
+        elif flag is None:
+            urls.append(value)
+    return _check_http(_method(methods, args, "POST" if bodies else "GET"), urls, bodies, cwd)
+
+
+_HTTPIE_VALUE = {"-a", "--auth", "-A", "--auth-type", "-o", "--output", "--session", "--session-read-only",
+                 "--verify", "--cert", "--cert-key", "--proxy", "-p", "--print", "--pretty", "-s", "--style",
+                 "--timeout", "--max-redirects", "--default-scheme", "--raw", "--boundary", "--format-options"}
+
+
+def check_httpie(args: list[str], cwd: str | None) -> str | None:
+    pos, bodies = [], []
+    for flag, value in _options(args, _HTTPIE_VALUE):
+        if flag == "--raw":
+            bodies.append(value)
+        elif flag is None:
+            pos.append(value)
+    methods = [pos.pop(0)] if len(pos) > 1 and not re.search(r"[./:]", pos[0]) else []
+    bodies += [item for item in pos[1:] if re.search(r"(?<!=)=(?!=)|@", item)]
+    return _check_http(_method(methods, args, "POST" if bodies else "GET"), pos[:1], bodies, cwd)
+
+
+# ---------------------------------------------------------------- databases
+
+
+_LOCAL = {"localhost", "127.0.0.1", "::1", "[::1]", ""}
+_PG_URL = re.compile(r"postgres(?:ql)?://(?:[^@/?#\s]*@)?([^/?#\s]*)(\S*)")
+_DB_ENV = re.compile(r"^(PGHOST|PGHOSTADDR|PGSERVICE|PGSERVICEFILE|DATABASE_URL|SUPABASE_DB_URL|POSTGRES_URL)=(.*)$",
+                     re.DOTALL)
+_SUPABASE_VALUE = {"--workdir", "-o", "--output", "-s", "--schema", "-f", "--file", "-p", "--password",
+                   "--version", "--status", "--profile", "--network-id"}
+_SUPABASE_LOCAL = {("db", "reset"), ("db", "start"), ("test", "db"), ("test", "new"), ("migration", "new"),
+                   ("migration", "list"), ("migrations", "new"), ("migrations", "list")}
+REMOTE_DB = "Connections to a remote database are not made from cloud sessions. " + DB_HINT
+
+
+def _is_local(host: str) -> bool:
+    host = host.strip("'\"").lower()
+    if not host.startswith("["):
+        host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    elif "]" in host:
+        host = host[:host.index("]") + 1]
+    return host in _LOCAL or host.startswith(("/", "%2f"))
+
+
+def _url_hosts(text: str) -> list[str]:
+    hosts = []
+    for m in _PG_URL.finditer(text):
+        hosts += m.group(1).split(",") + re.findall(r"[?&](?:host|hostaddr)=([^&\s]*)", m.group(2))
+    return hosts
+
+
+def check_db_env(words: list[str]) -> str | None:
+    for w in words:
+        m = _DB_ENV.match(w)
+        if not m:
+            continue
+        name, value = m.groups()
+        hosts = value.split(",") if name in ("PGHOST", "PGHOSTADDR") else _url_hosts(value)
+        if name.startswith("PGSERVICE") or _EXPANDS.search(value) or not all(map(_is_local, hosts)):
+            return f"`{name}` must name a local database here. {REMOTE_DB}"
     return None
+
+
+def check_db_client(args: list[str], cwd: str | None) -> str | None:
+    if any(_EXPANDS.search(a) for a in args):
+        return f"A database target held in a variable {VAR_HINT}"
+    if any(re.search(r"\bservice\s*=", a) for a in args):
+        return f"A pg_service entry can point anywhere. {REMOTE_DB}"
+    hosts = []
+    for k, a in enumerate(args):
+        if a in ("-h", "--host"):
+            hosts.append(args[k + 1] if k + 1 < len(args) else "")
+        elif a.startswith("--host="):
+            hosts.append(a[len("--host="):])
+        elif a.startswith("-h") and not a.startswith("--"):
+            hosts.append(a[2:])
+        hosts += _url_hosts(a) + re.findall(r"(?:^|\s)(?:host|hostaddr)\s*=\s*'?([^\s']*)", a)
+    if not hosts:
+        hosts = [os.environ.get("PGHOST", ""), os.environ.get("PGHOSTADDR", "")]
+        if os.environ.get("PGSERVICE"):
+            return f"PGSERVICE is set. {REMOTE_DB}"
+    return None if all(_is_local(h) for host in hosts for h in host.split(",")) else REMOTE_DB
+
+
+def check_supabase(args: list[str], cwd: str | None) -> str | None:
+    if any(SENT in a for a in args):
+        return f"A supabase command with a shell expansion {VAR_HINT}"
+    if any(a.split("=", 1)[0] in ("--linked", "--db-url", "--project-ref") for a in args):
+        return DB_HINT
+    pos = _non_flags(args, _SUPABASE_VALUE)
+    group, action = (pos + [None, None])[:2]
+    if group not in ("db", "migration", "migrations", "test", "inspect", "sql") or "--local" in args:
+        return None
+    return None if (group, action) in _SUPABASE_LOCAL else DB_HINT
+
+
+# ---------------------------------------------------------------- decision
+
+
+CHECKS = {"gh": check_gh, "hub": check_gh, "curl": check_curl, "wget": check_wget, "http": check_httpie,
+          "https": check_httpie, "xh": check_httpie, "xhs": check_httpie, "supabase": check_supabase,
+          **dict.fromkeys(("psql", "pg_dump", "pg_dumpall", "pg_restore", "pgcli", "usql"), check_db_client)}
+
+
+def check_segment(words: list[str], cwd: str | None) -> str | None:
+    cmd = next((w for w in words if not (_ASSIGN.match(w) or os.path.basename(w) in _LEADERS
+                                         or w.startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", w))), None)
+    if cmd is not None and os.path.basename(cmd) in ("echo", "printf"):
+        return None
+    if cmd is not None and _EXPANDS.search(cmd) and not re.match(r"\$\{?HOME\}?/", cmd.replace(SENT, "")):
+        return f"The command name `{cmd.replace(SENT, '')}` {VAR_HINT}"
+    reason = check_db_env(words)
+    if reason:
+        return reason
+    k = next((k for k, w in enumerate(words) if os.path.basename(w).split("@")[0] in CHECKS), None)
+    if k is None:
+        return None if all(map(_is_local, _url_hosts(" ".join(words)))) else REMOTE_DB
+    args = words[k + 1:]
+    if any(os.path.basename(w) in ("xargs", "parallel") for w in words[:k]):
+        args = args + [SENT]  # xargs appends words we can't see
+    return (CHECKS[os.path.basename(words[k]).split("@")[0]](args, cwd)
+            or (None if all(map(_is_local, _url_hosts(" ".join(words)))) else REMOTE_DB))
 
 
 def _decide(command: str, cwd: str | None) -> str | None:
-    here = cwd
-    moved: dict[str, object] = {}  # repo -> branch an earlier command switched to (None: unknown)
-    for cmd in segments(command):
-        head = os.path.basename(cmd.words[0])
-        if head in ("cd", "pushd"):
-            here = _chdir(here, cmd.words[1:])
-            continue
-        if head == "gh" and cmd.words[1:3] == ["pr", "checkout"]:
-            moved[_repo_key(here)] = None
-        reason = (check_git(cmd, here, moved) or check_gh(cmd.words, here)
-                  or check_curl(cmd.words, here) or check_database(cmd))
+    form = push_form(command)
+    if form is not None:
+        cd, args = form
+        if cd is not None:
+            if cd.startswith("-"):
+                return PUSH_HINT
+            cwd = os.path.join(cwd or os.getcwd(), os.path.expanduser(cd))
+        return check_push(args, cwd)
+    try:
+        segs = segments(command)
+    except ValueError:
+        segs = None
+    flat = "" if segs is None else " ".join(w for words in segs for w in words).replace(SENT, "$")
+    if could_push(command, flat):
+        return PUSH_HINT
+    if segs is None:
+        return UNREADABLE if _RISKY.search(command) else None
+    for words in segs:
+        reason = check_segment(words, cwd)
         if reason:
             return reason
-    return None
+    return check_aliases(segs, cwd)
 
 
 def decide(command: str, cwd: str | None) -> str | None:
     try:
         return _decide(command, cwd)
     except Exception:  # odd input must not switch the guard off for risky commands
-        if any(w in command for w in _RISKY_WORDS):
-            return "Could not read this command safely. Split it into simple commands without nested quoting."
-        return None
+        return UNREADABLE if _RISKY.search(command) else None
 
 
 def main() -> int:
