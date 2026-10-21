@@ -368,3 +368,55 @@ def test_hook_in_cloud_denies(monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert out["hookSpecificOutput"]["permissionDecisionReason"].startswith("[cloud guard] ")
+
+
+# ---------------------------------------------------------------- branch switches inside one command
+
+SWITCH_THEN_PUSH_BLOCKED = [
+    "git checkout main && git push -u origin HEAD",
+    "git switch main; git push origin @",
+    "git checkout -q main && git push origin HEAD",
+    "git checkout -B main && git push origin HEAD",
+    "git switch -c main origin/main && git push origin HEAD",
+    "git switch --create=main && git push origin HEAD",
+    "git checkout -t origin/main && git push origin HEAD",
+    "git branch -m main && git push origin HEAD",
+    "git branch -M feat/x main && git push origin HEAD",
+    "git symbolic-ref HEAD refs/heads/main && git push origin HEAD",
+    "git checkout --detach && git push origin HEAD",
+    "git checkout - && git push origin HEAD",
+    "git checkout $BRANCH && git push origin HEAD",
+    "gh pr checkout 5 && git push origin HEAD",
+    "git checkout feat/other && git push",
+    "(git checkout main) && git push origin HEAD",
+    "bash -c 'git checkout main && git push -u origin HEAD'",
+]
+
+SWITCH_THEN_PUSH_ALLOWED = [
+    "git checkout -b feat/new && git push -u origin HEAD",
+    "git switch -c fix/y origin/main && git push -u origin HEAD",
+    "git checkout main && git pull && git checkout -b feat/z && git push -u origin HEAD",
+    "git checkout -- README.md && git push -u origin HEAD",
+    "git checkout main -- README.md && git push -u origin HEAD",
+    "git checkout main && git push -u origin feat/x",
+    "git branch -d old && git push -u origin HEAD",
+    "git symbolic-ref HEAD && git push -u origin HEAD",
+]
+
+
+@pytest.mark.parametrize("cmd", SWITCH_THEN_PUSH_BLOCKED)
+def test_switch_then_push_blocked(fake_git, cmd):
+    assert guard.decide(cmd, None), cmd
+
+
+@pytest.mark.parametrize("cmd", SWITCH_THEN_PUSH_ALLOWED)
+def test_switch_then_push_allowed(fake_git, cmd):
+    assert guard.decide(cmd, None) is None, cmd
+
+
+def test_switch_in_another_repo_does_not_move_this_one(make_repo):
+    here = make_repo("here")
+    other = make_repo("other")
+    assert guard.decide(f"git -C {other} checkout main && git push -u origin HEAD", str(here)) is None
+    assert guard.decide(f"cd {other} && git checkout main && git push -u origin HEAD", str(here))
+    assert guard.decide("git checkout main && git push -u origin HEAD", str(here))

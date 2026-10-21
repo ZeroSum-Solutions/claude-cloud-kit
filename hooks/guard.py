@@ -406,7 +406,63 @@ def ref_branch(ref: str, branch: str | None) -> str | None:
     return ref
 
 
-def check_git(cmd: Simple, here: str | None) -> str | None:
+KEEP = object()  # HEAD did not move
+
+
+def _repo_key(where: str | None) -> str:
+    return _git(where, "rev-parse", "--show-toplevel") or os.path.normpath(where or os.getcwd())
+
+
+def head_after(sub: str, args: list[str]):
+    """Branch HEAD names after `git <sub> <args>`: KEEP if HEAD does not move, None if unknown."""
+    if any("$" in a or "`" in a for a in args):
+        return None
+    flags = [a for a in args if a.startswith("-")]
+    plain = [a for a in args if not a.startswith("-")]
+    if sub == "branch":
+        if not any(f in ("-m", "-M", "--move") for f in flags):
+            return KEEP
+        return plain[0] if len(plain) == 1 else None
+    if sub == "symbolic-ref":
+        if any(f in ("-d", "--delete") for f in flags):
+            return None
+        return ref_branch(plain[1], None) if plain[:1] == ["HEAD"] and len(plain) > 1 else KEEP
+    if sub == "bisect":
+        return None if plain[:1] in (["start"], ["reset"]) else KEEP
+    # checkout / switch
+    if sub == "checkout" and "--" in args:
+        return KEEP  # `git checkout [<tree-ish>] -- <paths>` restores files
+    create, track, detach, rest, i = None, False, False, [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a in ("-b", "-B", "-c", "-C", "--create", "--force-create", "--orphan"):
+            create = args[i] if i < len(args) else None
+            i += 1
+        elif a.startswith(("--create=", "--force-create=", "--orphan=")):
+            create = a.split("=", 1)[1]
+        elif a in ("-d", "--detach"):
+            detach = True
+        elif a == "-t" or a.startswith("--track"):
+            track = True
+        elif a == "-" or not a.startswith("-"):
+            rest.append(a)  # a lone "-" is the previous branch, not a flag
+    if create:
+        return create
+    if detach:
+        return None
+    if not rest:
+        return None if track else KEEP
+    if sub == "checkout" and len(rest) > 1:
+        return KEEP  # `git checkout <tree-ish> <paths>`
+    target = rest[0]
+    if target == "-" or target.startswith("@{"):
+        return None
+    return target.split("/", 1)[1] if track and "/" in target else target
+
+
+def check_git(cmd: Simple, here: str | None, moved: dict[str, object] | None = None) -> str | None:
+    moved = {} if moved is None else moved
     words = cmd.words
     if os.path.basename(words[0]) != "git":
         return None
@@ -433,18 +489,26 @@ def check_git(cmd: Simple, here: str | None) -> str | None:
             i += 1
         else:
             break
-    if i >= len(words) or words[i] != "push":
+    if i >= len(words):
+        return None
+    if words[i] in ("checkout", "switch", "branch", "symbolic-ref", "bisect"):
+        head = head_after(words[i], words[i + 1:])
+        if head is not KEEP:
+            moved[_repo_key(where)] = head
+        return None
+    if words[i] != "push":
         return None
     if config or any(a.startswith("GIT_CONFIG") for a in cmd.assigns):
         return ("`git -c ... push` can change where the push goes. Drop the -c option and push your "
                 "feature branch: `git push -u origin HEAD`.")
-    return check_push(words[i + 1:], where)
+    return check_push(words[i + 1:], where, moved.get(_repo_key(where), KEEP) if moved else KEEP)
 
 
 _PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
 
 
-def check_push(args: list[str], where: str | None) -> str | None:
+def check_push(args: list[str], where: str | None, head: object = KEEP) -> str | None:
+    """head: the branch an earlier command in the same line switched to (None if unknown)."""
     force_all = delete = lease_all = False
     leased: set[str] = set()
     positional: list[str] = []
@@ -488,13 +552,18 @@ def check_push(args: list[str], where: str | None) -> str | None:
 
     remote = positional[0] if positional else None
     specs = positional[1:]
-    branch = current_branch(where)
+    branch = current_branch(where) if head is KEEP else head
     protected = protected_for(where, remote)
     if force_all:
         # --force disables the lease checks too (git-push(1)), so a lease does not make it safe.
         return "Force push without a lease is blocked. Use `git push --force-with-lease` on your feature branch."
     if not specs:
-        return None if delete else _check_default_push(where, branch, protected)
+        if delete:
+            return None
+        if head is not KEEP:
+            return ("A bare `git push` after switching branches in the same command can't be checked. "
+                    "Push as its own command, or name the branch: `git push -u origin HEAD`.")
+        return _check_default_push(where, branch, protected)
     for spec in specs:
         forced = spec.startswith("+")
         spec = spec.removeprefix("+")
@@ -761,12 +830,15 @@ def check_database(cmd: Simple) -> str | None:
 
 def _decide(command: str, cwd: str | None) -> str | None:
     here = cwd
+    moved: dict[str, object] = {}  # repo -> branch an earlier command switched to (None: unknown)
     for cmd in segments(command):
         head = os.path.basename(cmd.words[0])
         if head in ("cd", "pushd"):
             here = _chdir(here, cmd.words[1:])
             continue
-        reason = (check_git(cmd, here) or check_gh(cmd.words, here)
+        if head == "gh" and cmd.words[1:3] == ["pr", "checkout"]:
+            moved[_repo_key(here)] = None
+        reason = (check_git(cmd, here, moved) or check_gh(cmd.words, here)
                   or check_curl(cmd.words, here) or check_database(cmd))
         if reason:
             return reason
