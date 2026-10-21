@@ -247,6 +247,9 @@ def pick_major(spec: str | None, default: int = DEFAULT_NODE, installed: tuple[i
     for major in candidates:
         if any(_major_in(r, major) for r in ranges):
             return major
+    for major in sorted(range(1, 18), key=lambda m: (m % 2 == 0, m), reverse=True):  # <18 -> 16
+        if any(_major_in(r, major) for r in ranges):
+            return major
     floors = [r[0][0] for r in ranges if r[0][0] > 0]
     if floors:
         return min(floors)
@@ -321,8 +324,8 @@ def _stream(url: str, deadline: float, sink) -> None:
         raise TimeoutError(f"ran out of the time budget downloading {url}")
 
     previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, _left(deadline))
     try:
+        signal.setitimer(signal.ITIMER_REAL, _left(deadline))
         with urllib.request.urlopen(url, timeout=min(20, _left(deadline))) as r:
             while chunk := r.read(64 * 1024):
                 sink(chunk)
@@ -589,13 +592,22 @@ def _write_request(repo: Path, sd: Path, node_major: int | None, node_bin: Path 
                                      "pin": node_spec(repo)[0] if pin is NO_PIN else pin})
 
 
-def _write_built(sd: Path, pin) -> None:
-    """The pin of the request the installed result was built for."""
+def _write_built(sd: Path, pin, node_major: int | None = None) -> None:
+    """The pin the installed result was built for, and the Node major it was built with."""
     if pin is NO_PIN:
         with contextlib.suppress(OSError):
             (sd / "built.json").unlink()
     else:
-        _write_json(sd, "built.json", {"pin": pin})
+        _write_json(sd, "built.json", {"pin": pin, "node": node_major})
+
+
+def _fallback_node(sd: Path) -> str | None:
+    """Why the installed result does not serve its pin: it was built with a fallback Node."""
+    built = _read_json(sd / "built.json")
+    pin, major = built.get("pin"), built.get("node")
+    if isinstance(pin, str) and isinstance(major, int) and not pin_allows(pin, major):
+        return f"built with Node {major}, which does not satisfy the pin ({pin})"
+    return None
 
 
 def _pin_changed(repo: Path, sd: Path) -> bool:
@@ -662,10 +674,12 @@ def run_install(repo: Path, node_major: int | None, node_bin: Path | None) -> in
             fcntl.flock(lock, fcntl.LOCK_EX)
             major, bin_dir, pin = request = _read_request(sd, default)
             done = _inputs_key(repo, *request)
+            if attempt:  # the inputs changed under the last round; record the pin they hold now
+                pin = node_spec(repo)[0]
             rc, status = _install_round(repo, major, bin_dir, sd)
             if attempt < 4 and _inputs_key(repo, *_read_request(sd, default)) != done:
                 status = "running (the inputs changed; installing again)"  # never a final status between rounds
-            _write_built(sd, pin)  # before the status, so a final status never meets an older pin
+            _write_built(sd, pin, major)  # before the status, so a final status never meets an older pin
             (sd / "status").write_text(status + "\n")
         if _inputs_key(repo, *_read_request(sd, default)) == done:
             break
@@ -692,7 +706,8 @@ def start_background_install(repo: Path, node_major: int | None, node_bin: Path 
     _write_request(repo, sd, node_major, node_bin, pin)  # before the running check; see run_install
     if all(plan_current(repo, p, node_major, sd) for p in plans):
         if not _install_running(sd):  # a running install records its own pin when it finishes
-            _write_built(sd, _read_request(sd, (None, None))[2])  # this Node's result already serves this pin
+            major, _, pin = _read_request(sd, (None, None))
+            _write_built(sd, pin, major)  # this Node's result already serves this pin
             if not (_read(sd / "status") or "").startswith("ok"):
                 # a failed or interrupted install for other inputs left its status behind
                 (sd / "status").write_text("; ".join(f"ok {p[0]} (unchanged)" for p in plans) + "\n")
@@ -720,6 +735,9 @@ def _settled(repo: Path, sd: Path, status: str) -> str:
     if _pin_changed(repo, sd) or not all(plan_current(repo, p, node_major, sd) for p in plans):
         return (f"stale: the lockfiles or Node changed after this install ({status}); "
                 "run `cloud-prep` to install again")
+    fallback = _fallback_node(sd)
+    if fallback:
+        return f"stale: {fallback} ({status}); run `cloud-prep` again once that Node can be installed"
     return status if status != "none" else "ok (" + ", ".join(f"{p[0]} unchanged" for p in plans) + ")"
 
 

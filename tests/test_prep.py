@@ -396,9 +396,51 @@ def test_the_install_records_the_pin_of_the_request_it_built(tmp_path, state, mo
     prep._write_request(repo, sd, 24, None, pin="24")
     assert prep.run_install(repo, 24, None) == 0
     assert prep.wait_status(repo, 1).startswith("ok npm (")
-    # A later prep reads lts/jod, which is also Node 24: nothing to install, and not stale.
-    (repo / ".nvmrc").write_text("lts/jod\n")
-    assert prep.start_background_install(repo, 24, None, pin="lts/jod").startswith("up to date")
+    # A later prep reads lts/krypton, which is also Node 24: nothing to install, and not stale.
+    (repo / ".nvmrc").write_text("lts/krypton\n")
+    assert prep.start_background_install(repo, 24, None, pin="lts/krypton").startswith("up to date")
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+
+
+def test_wait_reports_a_fallback_node_build_as_stale(tmp_path, state, monkeypatch):
+    # Argon R5: Node 26 could not be installed, cloud-prep fell back to 24; --wait must not say ok.
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("26\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="26")
+    assert prep.run_install(repo, 24, None) == 0
+    assert json.loads((sd / "built.json").read_text()) == {"pin": "26", "node": 24}
+    status = prep.wait_status(repo, 1)
+    assert status.startswith("stale: built with Node 24, which does not satisfy the pin (26)"), status
+
+
+def test_a_later_round_records_the_pin_the_repo_holds_then(tmp_path, state, monkeypatch):
+    # Argon R5: the pin and a lockfile change during round 1 with no new cloud-prep; round 2
+    # reinstalls and records the new pin, not the first request's.
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="24")
+    real = prep._install_round
+    rounds = []
+
+    def round_(*args):
+        rounds.append(1)
+        if len(rounds) == 1:
+            (repo / ".nvmrc").write_text(">=24\n")
+            (repo / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        return real(*args)
+
+    monkeypatch.setattr(prep, "_install_round", round_)
+    assert prep.run_install(repo, 24, None) == 0
+    assert len(rounds) == 2
+    assert json.loads((sd / "built.json").read_text()) == {"pin": ">=24", "node": 24}
     assert prep.wait_status(repo, 1).startswith("ok npm (")
 
 
@@ -711,12 +753,17 @@ def test_fallback_prefers_the_newest_node_in_opt(tmp_path, state, monkeypatch):
 def test_an_unsatisfiable_pin_is_said_plainly(tmp_path, state, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".nvmrc").write_text("<18\n")
-    node_dir = tmp_path / "opt" / "node18"
-    _exe(node_dir / "bin" / "node", "echo v18.20.0")
+    (repo / ".nvmrc").write_text("<18 >20\n")
+    node_dir = tmp_path / "opt" / "node21"
+    _exe(node_dir / "bin" / "node", "echo v21.7.0")
     monkeypatch.setattr(prep, "install_node", lambda major, deadline: node_dir)
     lines = prep.prep(repo, write_session_env=False, primary=True, deadline=time.monotonic() + 5)
-    assert "does not satisfy the pin (from .nvmrc: <18)" in lines[0]
+    assert "does not satisfy the pin (from .nvmrc: <18 >20)" in lines[0]
+
+
+def test_an_upper_bound_below_the_known_majors_picks_the_newest_lts_under_it():
+    assert prep.pick_major("<18") == 16
+    assert prep.pick_major("<=17") == 16
 
 
 def test_only_the_primary_repo_sets_path(tmp_path, state, monkeypatch):
