@@ -363,6 +363,14 @@ BYPASSES += [
     # round 6 (Sol): attached gh api fields are writes
     "gh api repos/o/r/git/refs -f'ref=refs/heads/backup' -f\"sha=$(git rev-parse HEAD)\"",
     "gh api repos/o/r/git/refs -Fsha=abc -fref=refs/heads/x",
+    # round 7 (Sol): shell grouping is command position; a GET in another call exempts nothing
+    "(supabase db pull)",
+    "{ supabase db push; }",
+    'gh api repos/o/r/git/refs -f ref=refs/heads/backup -f "sha=$(git rev-parse origin/main)" && gh api -X GET repos/o/r/git/refs',
+    "pnpm exec supabase db dump",
+    "yarn dlx supabase inspect db",
+    "bun x supabase link",
+    "source .env && supabase db pull",
 ]
 
 # Harmless commands refused on purpose: the price of matching raw text instead of parsing shell.
@@ -553,6 +561,9 @@ ALLOWED = [
     "gh api repos/o/r/pulls -f title=t -f head=feat/x -f base=main -f body='Updated src/hooks/useAuth.ts'",
     "git commit -m 'docs: explain `supabase start` readiness'",
     "DATABASE_URL='host=127.0.0.1 dbname=test_db' python -m pytest -q",
+    # round 7 (Sol): a filename is not `source`; SQL `service='x'` is not a libpq service
+    'pytest tests/supabase -k "$TEST" --cov=src/source.py',
+    "psql -h127.0.0.1 -c \"SELECT service='billing' FROM jobs\"",
 ]
 
 # Allowed on purpose: GitHub refuses these (the Claude GitHub App has no administration write),
@@ -645,6 +656,10 @@ def test_inherited_pghost_with_empty_uri_host(fake_git, monkeypatch):
     monkeypatch.setenv("PGHOST", "db.internal")
     assert guard.decide("psql postgresql:///app", None)
     assert guard.decide("DATABASE_URL='dbname=x host=db.internal' npm test", None)
+    # Sol round 7: grouping, and a hostless keyword string in DATABASE_URL, inherit PGHOST too
+    monkeypatch.setenv("PGHOST", "db.example.supabase.co")
+    assert guard.decide('(psql -c "SELECT 1")', None)
+    assert guard.decide("DATABASE_URL='dbname=app' python -c 'import os'", None)
 
 
 def test_non_origin_default_not_inspected(fake_git, monkeypatch):
@@ -662,7 +677,8 @@ def test_long_wrapper_chains_stay_fast(fake_git):
     # exponentially (`sudo -u sudo -u ...` hung the hook).
     import time
     wrapper = "su" + "do"
-    for chunk in (f"{wrapper} -u ", f"{wrapper} -u A=1 ", "nice -n 5 ", "env -i ", "npx -y "):
+    for chunk in (f"{wrapper} -u ", f"{wrapper} -u A=1 ", "nice -n 5 ", "env -i ", "npx -y ",
+                  "pnpm exec ", "npm exec ", "yarn dlx ", "bun x ", "( ", "{ "):
         start = time.monotonic()
         guard.decide(chunk * 60 + "psql -h db.example.net", None)
         assert time.monotonic() - start < 1

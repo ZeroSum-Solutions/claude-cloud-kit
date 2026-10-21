@@ -213,10 +213,13 @@ _GH_GET = re.compile(r"(?:-X|--method)[\s=]*['\"]?GET\b")
 
 
 def _gh_writes(text: str) -> bool:
-    """gh api sends a write unless the method is GET (fields then become query parameters)."""
-    if _GH_GET.search(text) and not re.search(r"\b(?:POST|PUT|PATCH|DELETE)\b|--input\b", text):
-        return False
-    return bool(_WRITE.search(text) or _GH_FIELD.search(text))
+    """gh api sends a write unless the method is GET (fields then become query parameters). Judged per command."""
+    for part in re.split(r"&&|\|\||[;|\n]", text):
+        if _GH_GET.search(part) and not re.search(r"\b(?:POST|PUT|PATCH|DELETE)\b|--input\b", part):
+            continue
+        if _WRITE.search(part) or _GH_FIELD.search(part):
+            return True
+    return False
 
 
 def check_github(command: str) -> str | None:
@@ -241,16 +244,18 @@ _REMOTE_HOST = re.compile(r"\.supabase\.co\b|pooler\.supabase\.com|\.rds\.amazon
                           r"|\.railway\.app|\.aivencloud\.com|\.cockroachlabs\.cloud", re.IGNORECASE)
 # A tool in command position: after a separator, `$(`, a shell keyword, wrappers, VAR=value and package runners.
 # Not after `(`, a backtick or a quote, so `feat(supabase):` and `run \`psql\`` in a message are text.
+# `pnpm exec`, `yarn dlx`, `bun x`: each word is a wrapper of its own, so no word can be read two ways
 _WRAP = (r"(?:time|nohup|nice|watch|sudo|env|exec|command|xargs|timeout|npx|bunx|uvx"
-         r"|npm\s+exec|pnpm(?:\s+(?:exec|dlx))?|yarn(?:\s+dlx)?|bun\s+x)(?![\w-])")
+         r"|npm|pnpm|yarn|bun|dlx|x)(?![\w-])")
 # a flag value is never a number, an assignment or a wrapper, so each word parses one way (no backtracking blowup)
-_START = (r"(?:^|[;&|\n]|\$\(|\b(?:then|do|else|if|while|until)\s|\b(?:bash|sh|zsh|dash|ksh)\s+-\w*c\s+['\"]?)\s*"
+_START = (r"(?:^|[;&|\n]|\$\(|(?<![\w$])[({]|\b(?:then|do|else|if|while|until)\s|\b(?:bash|sh|zsh|dash|ksh)\s+-\w*c\s+['\"]?)\s*"
           r"(?:(?:[A-Za-z_]\w*=\S*|" + _WRAP + r"(?:\s+-\S+(?:\s+(?!\d|[A-Za-z_]\w*=|" + _WRAP
           + r")[^-\s]\S*)?|\s+\d\S*)*)\s+)*\$?(?:\S*/)?")
 _SUPABASE_NAME = r"(supabase)(?![\w/-])"
 _PG_NAME = r"(psql|pg_dump|pg_dumpall|pg_restore|pgcli|usql)(?![\w-])"
 # Piped into a shell, eval'd or fed through xargs: the tool's words can come from anywhere, so match the whole text.
-_SHELL_FED = re.compile(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|ksh)\b|\beval\b|\bsource\b|\bxargs\b|<\(")
+_SHELL_FED = re.compile(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|ksh)\b|(?:^|[;&|\n({]|\$\()\s*(?:eval|source|xargs)\b"
+                        r"|<\(")
 _SUPABASE_REMOTE = re.compile(r"--linked\b|--db-url\b|--project-ref\b|[$`]"
                               r"|\b(?:dump|pull|push|link|repair|fetch|inspect)\b")
 _PG_HOST = re.compile(r"postgres(?:ql)?://(?:[^@/\s'\"]*@)?([^/?\s'\"]*)|(?:host|hostaddr)=['\"]?([^\s'\";&]*)"
@@ -265,7 +270,9 @@ _LOCAL_VALUE = re.compile(r"|/.*|(?:sqlite3?|file):.*|::1"
 
 def _local_value(value: str) -> bool:
     if "://" not in value and "=" in value:  # libpq keywords: host=127.0.0.1 dbname=test
-        return all(_LOCAL.fullmatch(h) for h in re.findall(r"\b(?:host|hostaddr)\s*=\s*([^\s]*)", value))
+        hosts = re.findall(r"\b(?:host|hostaddr)\s*=\s*([^\s]*)", value) or [
+            os.environ.get("PGHOST", ""), os.environ.get("PGHOSTADDR", "")]  # no host: libpq uses PGHOST
+        return all(_LOCAL.fullmatch(h) for host in hosts for h in host.split(","))
     return bool(_LOCAL_VALUE.fullmatch(value))
 
 
@@ -290,8 +297,9 @@ def check_db(command: str) -> str | None:
     if re.search(r"api\.supabase\.com", command, re.IGNORECASE) and (
             re.search(r"/database/(?:query|migrations)", command) or _WRITE.search(command)):
         return DB_HINT
-    for seg in (s for text in (command, plain) for s in _segments(_PG_NAME, text)):
-        if re.search(r"[$`]|\bservice=", seg):
+    # service= on the original text only: stripping quotes turns SQL `service='x'` into a keyword
+    for seg, original in ((s, text is command) for text in (command, plain) for s in _segments(_PG_NAME, text)):
+        if re.search(r"[$`]", seg) or (original and re.search(r"\bservice=[\w-]", seg)):
             return f"A database target held in a variable or pg_service entry can't be checked. {DB_HINT}"
         if os.environ.get("PGSERVICE"):
             return f"PGSERVICE is set. {DB_HINT}"
