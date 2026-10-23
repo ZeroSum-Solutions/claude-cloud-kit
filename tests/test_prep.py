@@ -65,9 +65,21 @@ def _exe(path: Path, body: str) -> Path:
     (">=18 <20", 18),
     ("25", 25),           # odd majors only when nothing else fits
     ("27", 27),           # beyond the known majors: fall back to the number in the pin
+    (">=20<23", 22),      # comparators without whitespace
+    (">=18<=20", 20),
+    ("lts/gallium", 16),  # nothing known fits: the lowest major the pin allows
+    (">26", 27),
+    ("garbage20", 20),    # unreadable: the number in the pin, not the default
+    ("lts/unknown", 24),
+    ("^22 || nonsense", 22),
 ])
 def test_pick_major(pin, major):
     assert prep.pick_major(pin) == major
+
+
+def test_pin_allows():
+    assert prep.pin_allows(None, 24) and prep.pin_allows(">=20<23", 22)
+    assert not prep.pin_allows("<18", 18) and not prep.pin_allows("garbage20", 20)
 
 
 def test_pick_major_uses_installed_majors():
@@ -137,6 +149,14 @@ def test_yarn_flags(tmp_path):
     (tmp_path / "package.json").write_text("{}")
     (tmp_path / ".yarnrc.yml").write_text("nodeLinker: node-modules\n")
     assert prep.install_plans(tmp_path)[0][1] == ["yarn", "install", "--immutable"]
+
+
+def test_yarn_pnp_output_is_the_pnp_file(tmp_path):
+    (tmp_path / "yarn.lock").write_text("")
+    (tmp_path / ".yarnrc.yml").write_text("enableTelemetry: false\n")
+    assert prep.install_plans(tmp_path)[0][3] == ".pnp.cjs"
+    (tmp_path / ".yarnrc.yml").write_text("nodeLinker: node-modules\n")
+    assert prep.install_plans(tmp_path)[0][3] == "node_modules"
 
 
 def test_poetry_has_no_install_dir(tmp_path):
@@ -254,6 +274,257 @@ def test_second_launch_skips_while_an_install_runs(tmp_path, state, monkeypatch)
     assert launched[0][-4:] == ["--node", "22", "--node-bin", "/opt/node22/bin"]
 
 
+def test_current_stamps_start_nothing(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    sd = prep.state_dir(repo)
+    (sd / "log").write_text("the real install log\n")
+    status = (sd / "status").read_text()
+    launched = []
+    monkeypatch.setattr(prep.subprocess, "Popen", lambda argv, **kw: launched.append(argv))
+    assert prep.start_background_install(repo, 24, None).startswith("up to date")
+    assert not launched and (sd / "status").read_text() == status
+    assert prep.run_install(repo, 24, None) == 0  # a child that finds nothing to do
+    assert (sd / "log").read_text() == "the real install log\n"
+
+
+def test_inputs_that_change_during_an_install_install_again(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    sd = prep.state_dir(repo)
+    # A second prep asks for Node 26 while the Node 24 install runs.
+    bin_dir = tmp_path / "fakebin"
+    _exe(bin_dir / "npm", f'''mkdir -p node_modules; echo "$@" >> npm.calls
+[ -f once ] || {{ touch once; echo '{{"node": 26, "node_bin": null}}' > "{sd}/request.json"; }}''')
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    assert prep.run_install(repo, 24, None) == 0
+    assert (repo / "npm.calls").read_text().count("ci") == 2
+    assert all(prep.plan_current(repo, p, 26, sd) for p in prep.install_plans(repo))
+
+
+def test_a_failed_reinstall_drops_the_old_stamp(tmp_path, state, monkeypatch):
+    bin_dir = _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    sd = prep.state_dir(repo)
+    assert (sd / "npm.sha256").exists()
+    # node_modules goes away; the reinstall makes part of it and fails
+    (repo / "node_modules").rmdir()
+    _exe(bin_dir / "npm", "mkdir -p node_modules; exit 1")
+    assert prep.run_install(repo, 24, None) == 1
+    assert not (sd / "npm.sha256").exists()
+    assert not prep.plan_current(repo, prep.install_plans(repo)[0], 24, sd)
+
+
+def test_a_timed_out_install_stops_its_children(tmp_path, state, monkeypatch):
+    bin_dir = tmp_path / "fakebin"
+    _exe(bin_dir / "npm", "(sleep 2; touch late) & sleep 30")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setattr(prep, "INSTALL_TIMEOUT", 1)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 1
+    assert "timed out after 1s" in (prep.state_dir(repo) / "status").read_text()
+    time.sleep(2.5)
+    assert not (repo / "late").exists()
+
+
+def test_wait_reports_a_stale_result(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    prep._write_request(repo, prep.state_dir(repo), 24, None)
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+    (repo / "package-lock.json").write_text('{"changed": true}')
+    assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
+
+
+def test_wait_reports_a_changed_node_pin_as_stale(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    prep._write_request(repo, prep.state_dir(repo), 24, None)
+    assert prep.run_install(repo, 24, None) == 0
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+    (repo / ".nvmrc").write_text("26\n")  # no prep ran since
+    assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
+
+
+def test_a_pin_changed_while_node_resolves_reads_as_stale(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    node_dir = tmp_path / "opt" / "node24"
+    _exe(node_dir / "bin" / "node", "echo v24.16.0")
+
+    def install_node(major, deadline):
+        (repo / ".nvmrc").write_text("26\n")  # the pin changes while Node 24 installs
+        return node_dir
+
+    monkeypatch.setattr(prep, "install_node", install_node)
+    real_popen = prep.subprocess.Popen
+
+    def popen(argv, **kw):  # the background child runs inline; npm and git stay real processes
+        return prep.run_install(repo, 24, node_dir / "bin") if "--install" in argv else real_popen(argv, **kw)
+
+    monkeypatch.setattr(prep.subprocess, "Popen", popen)
+    prep.prep(repo, write_session_env=False, primary=True, deadline=time.monotonic() + 5)
+    assert json.loads((prep.state_dir(repo) / "request.json").read_text())["pin"] == "24"
+    assert prep.wait_status(repo, 1).startswith("stale: the lockfiles or Node changed")
+
+
+def test_the_install_records_the_pin_of_the_request_it_built(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="24")
+    assert prep.run_install(repo, 24, None) == 0
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+    # A later prep reads lts/krypton, which is also Node 24: nothing to install, and not stale.
+    (repo / ".nvmrc").write_text("lts/krypton\n")
+    assert prep.start_background_install(repo, 24, None, pin="lts/krypton").startswith("up to date")
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+
+
+def test_wait_reports_a_fallback_node_build_as_stale(tmp_path, state, monkeypatch):
+    # Argon R5: Node 26 could not be installed, cloud-prep fell back to 24; --wait must not say ok.
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("26\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="26")
+    assert prep.run_install(repo, 24, None) == 0
+    assert json.loads((sd / "built.json").read_text()) == {"pin": "26", "node": 24}
+    status = prep.wait_status(repo, 1)
+    assert status.startswith("stale: built with Node 24, which does not satisfy the pin (26)"), status
+
+
+def test_a_python_only_repo_ignores_the_node_pin(tmp_path, state, monkeypatch):
+    # Argon R6: with only uv, a Node pin change or a fallback Node is not a reason to call it stale.
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "uv.lock").write_text("")
+    (repo / ".nvmrc").write_text("26\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="26")
+    assert prep.run_install(repo, 24, None) == 0
+    (repo / ".nvmrc").write_text("22\n")
+    assert prep.wait_status(repo, 1).startswith("ok uv ("), prep.wait_status(repo, 1)
+
+
+def test_a_later_round_records_the_pin_the_repo_holds_then(tmp_path, state, monkeypatch):
+    # Argon R5: the pin and a lockfile change during round 1 with no new cloud-prep; round 2
+    # reinstalls and records the new pin, not the first request's.
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    (repo / ".nvmrc").write_text("24\n")
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 24, None, pin="24")
+    real = prep._install_round
+    rounds = []
+
+    def round_(*args):
+        rounds.append(1)
+        if len(rounds) == 1:
+            (repo / ".nvmrc").write_text(">=24\n")
+            (repo / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        return real(*args)
+
+    monkeypatch.setattr(prep, "_install_round", round_)
+    assert prep.run_install(repo, 24, None) == 0
+    assert len(rounds) == 2
+    assert json.loads((sd / "built.json").read_text()) == {"pin": ">=24", "node": 24}
+    assert prep.wait_status(repo, 1).startswith("ok npm (")
+
+
+def test_concurrent_requests_do_not_share_a_temp_file(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sd = prep.state_dir(repo)
+    real = os.replace
+    nested = []
+
+    def replace(src, dst):
+        if not nested:  # another prep writes its request in between
+            nested.append(1)
+            prep._write_request(repo, sd, 26, None)
+        real(src, dst)
+
+    monkeypatch.setattr(prep.os, "replace", replace)
+    prep._write_request(repo, sd, 24, None)
+    assert prep._read_request(sd, (None, None))[0] == 24
+    assert sorted(f.name for f in sd.iterdir()) == ["request.json"]
+
+
+def test_wait_never_sees_a_final_status_between_install_rounds(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    sd = prep.state_dir(repo)
+    bin_dir = tmp_path / "fakebin"
+    _exe(bin_dir / "npm", f'''mkdir -p node_modules; echo "$@" >> npm.calls
+[ -f once ] || {{ touch once; echo '{{"node": 26, "node_bin": null}}' > "{sd}/request.json"; }}''')
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    seen = []
+    real_round = prep._install_round
+
+    def install_round(*a):
+        seen.append(prep._read(sd / "status") or "")
+        return real_round(*a)
+
+    monkeypatch.setattr(prep, "_install_round", install_round)
+    assert prep.run_install(repo, 24, None) == 0
+    assert len(seen) == 2 and seen[1].startswith("running")
+    assert (sd / "status").read_text().startswith("ok npm (")
+
+
+def test_wait_keeps_waiting_while_a_newer_install_runs(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    sd = prep.state_dir(repo)
+    prep._write_request(repo, sd, 26, None)  # a newer request, its install running
+    with open(sd / "lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert prep.wait_status(repo, 1).startswith("running")
+    assert prep.wait_status(repo, 1).startswith("stale")
+
+
+def test_up_to_date_replaces_an_old_failed_status(tmp_path, state, monkeypatch):
+    _fake_managers(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text("{}")
+    assert prep.run_install(repo, 24, None) == 0
+    sd = prep.state_dir(repo)
+    (sd / "status").write_text("failed npm ci (exit 1, 3s) — log: x\n")  # from another branch
+    assert prep.start_background_install(repo, 24, None).startswith("up to date")
+    assert prep.wait_status(repo, 1).startswith("ok npm")
+
+
 def test_wait_reports_a_dead_install(tmp_path, state):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -347,6 +618,39 @@ def test_install_node_respects_the_deadline(tmp_path, monkeypatch):
         prep.install_node(26, time.monotonic() - 1)
 
 
+class _Trickle(_Response):
+    """A server that sends one byte every 50 ms, forever."""
+    def read1(self, n=-1):
+        time.sleep(0.05)
+        return b"x"
+
+    read = read1
+
+
+def test_trickling_headers_stop_at_the_deadline(monkeypatch):
+    def urlopen(url, timeout=None):  # headers that arrive a line every 50 ms, forever
+        while True:
+            time.sleep(0.05)
+
+    monkeypatch.setattr(prep.urllib.request, "urlopen", urlopen)
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        prep._fetch("https://example.invalid/x", time.monotonic() + 0.5)
+    assert time.monotonic() - start < 2
+
+
+@pytest.mark.parametrize("call", ["fetch", "download"])
+def test_a_trickling_download_stops_at_the_deadline(tmp_path, monkeypatch, call):
+    monkeypatch.setattr(prep.urllib.request, "urlopen", lambda url, timeout=None: _Trickle())
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        if call == "fetch":
+            prep._fetch("https://example.invalid/x", time.monotonic() + 0.5)
+        else:
+            prep._download("https://example.invalid/x", tmp_path / "x", time.monotonic() + 0.5)
+    assert time.monotonic() - start < 2
+
+
 def test_install_node_waits_for_the_lock(tmp_path, monkeypatch):
     opt = tmp_path / "opt"
     opt.mkdir()
@@ -381,6 +685,35 @@ def test_corepack_is_pinned_and_checked(tmp_path, monkeypatch):
     assert problems == ["npm install: exit 1 npm ERR! network down"]
 
 
+def test_corepack_checks_for_shims_inside_the_lock(tmp_path):
+    node_dir = tmp_path / "node26"
+    _exe(node_dir / "bin" / "pnpm", "true")
+    _exe(node_dir / "bin" / "yarn", "true")
+    with open(tmp_path / ".node26.corepack.lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(TimeoutError):
+            prep.ensure_corepack(node_dir, time.monotonic() + 1)
+    assert prep.ensure_corepack(node_dir, time.monotonic() + 1) == []
+
+
+def test_prep_makes_pnpm_shims_before_returning(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package.json").write_text(json.dumps({"packageManager": "pnpm@10.0.0"}))
+    opt = tmp_path / "opt"
+    node_dir = opt / "node24"
+    _exe(node_dir / "bin" / "node", "echo v24.16.0")
+    monkeypatch.setattr(prep, "OPT", opt)
+    monkeypatch.setattr(prep, "install_node", lambda major, deadline: node_dir)
+    order = []
+    monkeypatch.setattr(prep, "ensure_corepack", lambda d, deadline: order.append(("corepack", d)) or ["offline"])
+    monkeypatch.setattr(prep, "start_background_install",
+                        lambda *a: order.append(("deps",)) or "no lockfile at the repo root; nothing to install")
+    lines = prep.prep(repo, write_session_env=False, primary=True, deadline=time.monotonic() + 5)
+    assert order == [("corepack", node_dir), ("deps",)]
+    assert "pnpm/yarn not ready: offline" in lines
+
+
 # ---------------------------------------------------------------- fallback Node
 
 def test_fallback_major_is_used_everywhere(tmp_path, state, monkeypatch):
@@ -390,6 +723,7 @@ def test_fallback_major_is_used_everywhere(tmp_path, state, monkeypatch):
     (repo / "package-lock.json").write_text("{}")
     path_node = _exe(tmp_path / "pathnode" / "node", "echo v22.11.0")
     monkeypatch.setenv("PATH", f"{path_node.parent}:/usr/bin:/bin")
+    monkeypatch.setattr(prep, "OPT", tmp_path / "opt")
 
     def no_node(major, deadline):
         raise TimeoutError("ran out of the time budget")
@@ -397,14 +731,53 @@ def test_fallback_major_is_used_everywhere(tmp_path, state, monkeypatch):
     monkeypatch.setattr(prep, "install_node", no_node)
     started = []
     monkeypatch.setattr(prep, "start_background_install",
-                        lambda r, major, node_bin: started.append((major, node_bin)) or "installing")
+                        lambda r, major, node_bin, pin: started.append((major, node_bin)) or "installing")
     env_file = tmp_path / "env"
     monkeypatch.setenv("CLAUDE_ENV_FILE", str(env_file))
     lines = prep.prep(repo, write_session_env=True, primary=True, deadline=time.monotonic() + 5)
     assert lines[0] == f"Node 26 not available (ran out of the time budget); using Node 22 from {path_node.parent}"
     assert started == [(22, path_node.parent)]
     written = env_file.read_text()
-    assert "PATH" not in written and "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" in written
+    assert f'export PATH="{path_node.parent}:$PATH"' in written and "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" in written
+
+
+def test_fallback_prefers_the_newest_node_in_opt(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".nvmrc").write_text("20\n")
+    opt = tmp_path / "opt"
+    for major in (24, 26):
+        _exe(opt / f"node{major}" / "bin" / "node", f"echo v{major}.1.0")
+        (opt / f"node{major}" / prep.NODE_MARKER).write_text("x\n")
+    monkeypatch.setattr(prep, "OPT", opt)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    def no_node(major, deadline):
+        raise TimeoutError("ran out of the time budget")
+
+    monkeypatch.setattr(prep, "install_node", no_node)
+    monkeypatch.setattr(prep, "start_background_install", lambda *a: "installing")
+    env_file = tmp_path / "env"
+    monkeypatch.setenv("CLAUDE_ENV_FILE", str(env_file))
+    lines = prep.prep(repo, write_session_env=True, primary=True, deadline=time.monotonic() + 5)
+    assert lines[0] == f"Node 20 not available (ran out of the time budget); using Node 26 from {opt / 'node26' / 'bin'}"
+    assert f'export PATH="{opt / "node26" / "bin"}:$PATH"' in env_file.read_text()
+
+
+def test_an_unsatisfiable_pin_is_said_plainly(tmp_path, state, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".nvmrc").write_text("<18 >20\n")
+    node_dir = tmp_path / "opt" / "node21"
+    _exe(node_dir / "bin" / "node", "echo v21.7.0")
+    monkeypatch.setattr(prep, "install_node", lambda major, deadline: node_dir)
+    lines = prep.prep(repo, write_session_env=False, primary=True, deadline=time.monotonic() + 5)
+    assert "does not satisfy the pin (from .nvmrc: <18 >20)" in lines[0]
+
+
+def test_an_upper_bound_below_the_known_majors_picks_the_newest_lts_under_it():
+    assert prep.pick_major("<18") == 16
+    assert prep.pick_major("<=17") == 16
 
 
 def test_only_the_primary_repo_sets_path(tmp_path, state, monkeypatch):
@@ -423,6 +796,6 @@ def test_only_the_primary_repo_sets_path(tmp_path, state, monkeypatch):
 
 
 def test_land_policy_lines():
-    assert "merges after green CI" in prep.land_policy("wiggdevin/zs-land-sandbox")
+    assert "decides at merge time" in prep.land_policy("wiggdevin/zs-land-sandbox")
     assert "stops for review" in prep.land_policy("wiggdevin/client-example")
     assert "not in the auto-merge allowlist" in prep.land_policy("someone/else")

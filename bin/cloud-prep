@@ -7,12 +7,14 @@ Run by the SessionStart hook (`cloud-prep --hook`) and by hand (`cloud-prep --wa
    .tool-versions, package.json volta/engines; default 24) and installs it into
    /opt/node<major> from nodejs.org when missing: SHA-256 checked, built next to /opt and
    renamed into place under a lock. The primary repo's Node goes first on PATH for the
-   session through CLAUDE_ENV_FILE. If the pinned Node can't be installed in time, the Node
-   already on PATH is used for everything that follows.
+   session through CLAUDE_ENV_FILE. If the pinned Node can't be installed in time, the newest
+   Node in /opt (else the one on PATH) is used for everything that follows. When the repo
+   uses pnpm or yarn, their corepack shims are made before the hook returns.
 2. Installs dependencies from the lockfiles in the background: one JS manager (pnpm, npm,
    yarn or bun) and one Python manager (uv or poetry), one install per repo at a time. A
-   hash stamp in the state dir skips an install when nothing changed. `cloud-prep --wait`
-   blocks until it finishes and prints the result.
+   hash stamp in the state dir skips an install when nothing changed; an install whose
+   inputs change while it runs installs again. `cloud-prep --wait` blocks until it finishes
+   and prints the result, or says the result is stale.
 3. In hook mode, prints a short context block for Claude: Node, deps, landing policy.
 
 Never fails the session: every problem becomes a line in the context block. Foreground
@@ -29,6 +31,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -142,8 +145,13 @@ def node_spec(repo: Path) -> tuple[str | None, str | None]:
 
 Version = tuple[int, int, int]
 _INF: Version = (10**9, 0, 0)
+_ANY: tuple[Version, Version] = ((0, 0, 0), _INF)
+_ANY_ALIASES = {"lts", "lts/*", "node", "latest", "stable", "current"}
+# A comparator starts the clause, follows whitespace or a comma, or follows a version
+# directly when it opens with an operator (">=20<23").
 _COMPARATOR = re.compile(
-    r"(?:^|(?<=[\s,]))(>=|<=|>|<|=|\^|~>?)?\s*v?(\d+|[x*])(?:\.(\d+|[x*]))?(?:\.(\d+|[x*]))?(?:[-+][0-9a-z.+-]*)?"
+    r"(?:^|(?<=[\s,])|(?<=\d)(?=[<>=]))"
+    r"(>=|<=|>|<|=|\^|~>?)?\s*v?(\d+|[x*])(?:\.(\d+|[x*]))?(?:\.(\d+|[x*]))?(?:[-+][0-9a-z.+-]*)?"
 )
 
 
@@ -186,8 +194,10 @@ def _bounds(op: str, parts: list[int]) -> tuple[Version, Version]:
 
 
 def _clause_range(clause: str) -> tuple[Version, Version] | None:
-    """[lo, hi) one `||` clause allows, or None when it does not restrict the version."""
+    """[lo, hi) one `||` clause allows, or None when the clause cannot be read."""
     clause = clause.strip().lower()
+    if clause in _ANY_ALIASES:
+        return _ANY
     if clause.startswith("lts/"):
         major = LTS_CODENAMES.get(clause[4:])
         return ((major, 0, 0), (major + 1, 0, 0)) if major else None
@@ -197,29 +207,39 @@ def _clause_range(clause: str) -> tuple[Version, Version] | None:
         right = _COMPARATOR.fullmatch(hyphen.group(2))
         if left and right and not left.group(1) and not right.group(1):
             return _pad(_parts(left.groups()[1:])), _bounds("<=", _parts(right.groups()[1:]))[1]
-    lo, hi, restricted = (0, 0, 0), _INF, False
+    if re.sub(r"[\s,]", "", _COMPARATOR.sub("", clause)):
+        return None  # text no comparator accounts for
+    lo, hi = _ANY
     for m in _COMPARATOR.finditer(clause):
         parts = _parts(m.groups()[1:])
-        if not parts:
-            continue
-        l, h = _bounds(m.group(1) or "", parts)
-        lo, hi, restricted = max(lo, l), min(hi, h), True
-    return (lo, hi) if restricted else None
+        if parts:
+            l, h = _bounds(m.group(1) or "", parts)
+            lo, hi = max(lo, l), min(hi, h)
+    return lo, hi
 
 
-def _major_in(rng: tuple[Version, Version] | None, major: int) -> bool:
-    if rng is None:
-        return True
+def _major_in(rng: tuple[Version, Version], major: int) -> bool:
     lo, hi = max(rng[0], (major, 0, 0)), min(rng[1], (major + 1, 0, 0))
     return lo < hi
 
 
+def _ranges(spec: str) -> list[tuple[Version, Version]]:
+    """The readable `||` clauses of a pin."""
+    return [r for r in (_clause_range(c) for c in spec.strip().lower().split("||")) if r]
+
+
+def pin_allows(spec: str | None, major: int) -> bool:
+    return not spec or any(_major_in(r, major) for r in _ranges(spec))
+
+
 def pick_major(spec: str | None, default: int = DEFAULT_NODE, installed: tuple[int, ...] = ()) -> int:
     """Major Node version for a pin. Prefers the default, then the newest even (LTS) major that
-    fits, then the newest odd one; falls back to the first number in the pin."""
+    fits, then the newest odd one. When none of those fits, takes the lowest major a clause
+    starts at (lts/gallium -> 16, >26 -> 27), then the first number in the pin. Clauses that
+    cannot be read are ignored; the caller reports a major that the pin does not allow."""
     if not spec:
         return default
-    ranges = [_clause_range(c) for c in spec.strip().lower().split("||")]
+    ranges = _ranges(spec)
     if any(_major_in(r, default) for r in ranges):
         return default
     candidates = sorted(set(installed) | set(range(18, NEWEST_NODE + 1)),
@@ -227,6 +247,12 @@ def pick_major(spec: str | None, default: int = DEFAULT_NODE, installed: tuple[i
     for major in candidates:
         if any(_major_in(r, major) for r in ranges):
             return major
+    for major in sorted(range(1, 18), key=lambda m: (m % 2 == 0, m), reverse=True):  # <18 -> 16
+        if any(_major_in(r, major) for r in ranges):
+            return major
+    floors = [r[0][0] for r in ranges if r[0][0] > 0]
+    if floors:
+        return min(floors)
     m = re.search(r"\d+", spec)
     return int(m.group()) if m else default
 
@@ -290,19 +316,38 @@ def _arch() -> str:
     return {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower(), "x64")
 
 
+def _stream(url: str, deadline: float, sink) -> None:
+    """Pass `url`'s body to `sink`. A timer signal ends the whole request, headers included,
+    at `deadline`, so a server that trickles bytes cannot hold us past it (socket timeouts
+    only measure silence). cloud-prep runs no threads, so the signal reaches this code."""
+    def expired(*_):
+        raise TimeoutError(f"ran out of the time budget downloading {url}")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, _left(deadline))
+        with urllib.request.urlopen(url, timeout=min(20, _left(deadline))) as r:
+            while chunk := r.read(64 * 1024):
+                sink(chunk)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _fetch(url: str, deadline: float) -> bytes:
-    with urllib.request.urlopen(url, timeout=min(20, _left(deadline))) as r:
-        return r.read()
+    body = bytearray()
+    _stream(url, deadline, body.extend)
+    return bytes(body)
 
 
 def _download(url: str, dest: Path, deadline: float) -> str:
     """Stream `url` to `dest` within the budget; returns the SHA-256 of what was written."""
     h = hashlib.sha256()
-    with urllib.request.urlopen(url, timeout=min(30, _left(deadline))) as r, open(dest, "wb") as f:
-        while chunk := r.read(1 << 20):
-            _left(deadline)
+    with open(dest, "wb") as f:
+        def sink(chunk: bytes) -> None:
             h.update(chunk)
             f.write(chunk)
+        _stream(url, deadline, sink)
     return h.hexdigest()
 
 
@@ -351,15 +396,15 @@ def install_node(major: int, deadline: float) -> Path:
 def ensure_corepack(node_dir: Path, deadline: float) -> list[str]:
     """pnpm/yarn shims come from corepack, which Node 25+ no longer ships. Returns problems."""
     bin_dir = node_dir / "bin"
-    if (bin_dir / "pnpm").exists() and (bin_dir / "yarn").exists():
-        return []
     env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", COREPACK_ENABLE_DOWNLOAD_PROMPT="0")
-    steps = []
-    if not (bin_dir / "corepack").exists():
-        steps.append([str(bin_dir / "npm"), "install", "-g", "--silent", "--ignore-scripts",
-                      f"corepack@{COREPACK_VERSION}"])
-    steps.append([str(bin_dir / "corepack"), "enable"])
     with _locked(node_dir.parent / f".{node_dir.name}.corepack.lock", deadline):
+        if (bin_dir / "pnpm").exists() and (bin_dir / "yarn").exists():
+            return []
+        steps = []
+        if not (bin_dir / "corepack").exists():
+            steps.append([str(bin_dir / "npm"), "install", "-g", "--silent", "--ignore-scripts",
+                          f"corepack@{COREPACK_VERSION}"])
+        steps.append([str(bin_dir / "corepack"), "enable"])
         for cmd in steps:
             label = " ".join([Path(cmd[0]).name, *cmd[1:2]])
             try:
@@ -395,8 +440,12 @@ def _js_plan(repo: Path) -> Plan | None:
     if (repo / "package-lock.json").exists():
         return "npm", ["npm", "ci", "--no-audit", "--no-fund"], ["package-lock.json", *pkg_inputs], "node_modules"
     if (repo / "yarn.lock").exists():
-        frozen = "--immutable" if _yarn_berry(repo) else "--frozen-lockfile"
-        return "yarn", ["yarn", "install", frozen], ["yarn.lock", ".yarnrc.yml", *pkg_inputs], "node_modules"
+        if not _yarn_berry(repo):
+            return "yarn", ["yarn", "install", "--frozen-lockfile"], ["yarn.lock", ".yarnrc.yml", *pkg_inputs], "node_modules"
+        # Yarn 2+ links with Plug'n'Play (.pnp.cjs, no node_modules) unless nodeLinker says otherwise.
+        m = re.search(r"^nodeLinker:\s*[\"']?([\w-]+)", _read(repo / ".yarnrc.yml") or "", re.M)
+        out = ".pnp.cjs" if (m.group(1) if m else "pnp") == "pnp" else "node_modules"
+        return "yarn", ["yarn", "install", "--immutable"], ["yarn.lock", ".yarnrc.yml", *pkg_inputs], out
     if (repo / "bun.lock").exists() or (repo / "bun.lockb").exists():
         lock = "bun.lock" if (repo / "bun.lock").exists() else "bun.lockb"
         return "bun", ["bun", "install", "--frozen-lockfile"], [lock, *pkg_inputs], "node_modules"
@@ -444,27 +493,62 @@ def _install_env(node_bin: Path | None) -> dict[str, str]:
     return env
 
 
+def _plan_stamp(repo: Path, plan: Plan, node_major: int | None) -> str:
+    manager, _, inputs, _ = plan
+    return stamp_for(repo, inputs, node_major if manager in JS_MANAGERS else None)
+
+
+def plan_current(repo: Path, plan: Plan, node_major: int | None, sd: Path) -> bool:
+    """The last successful install of this plan used these inputs and its output is still there."""
+    manager, _, _, out_dir = plan
+    return ((_read(sd / f"{manager}.sha256") or "").strip() == _plan_stamp(repo, plan, node_major)
+            and (out_dir is None or (repo / out_dir).exists()))
+
+
+def _needs_corepack(repo: Path, plans: list[Plan]) -> bool:
+    if any(p[0] in ("pnpm", "yarn") for p in plans):
+        return True
+    try:
+        pm = json.loads(_read(repo / "package.json") or "{}").get("packageManager", "")
+    except (ValueError, AttributeError):
+        return False
+    return str(pm).startswith(("pnpm@", "yarn@"))
+
+
 def _run_plan(repo: Path, plan: Plan, node_major: int | None, env: dict[str, str], sd: Path, log) -> str:
     """Run one plan unless its stamp is current. Returns its status part."""
-    manager, cmd, inputs, out_dir = plan
-    stamp = stamp_for(repo, inputs, node_major if manager in JS_MANAGERS else None)
-    stamp_file = sd / f"{manager}.sha256"
-    if (_read(stamp_file) or "").strip() == stamp and (out_dir is None or (repo / out_dir).is_dir()):
+    manager, cmd, _, _ = plan
+    if plan_current(repo, plan, node_major, sd):
         return f"ok {manager} (unchanged)"
+    stamp = _plan_stamp(repo, plan, node_major)
+    stamp_file = sd / f"{manager}.sha256"
     exe = shutil.which(cmd[0], path=env.get("PATH"))
     if not exe:
         return f"failed {' '.join(cmd)} ({cmd[0]} not found on PATH) — log: {sd / 'log'}"
+    # A failed or interrupted install leaves a partial output dir; the old stamp must not vouch for it.
+    with contextlib.suppress(OSError):
+        stamp_file.unlink(missing_ok=True)
     (sd / "status").write_text(f"running {' '.join(cmd)}\n")
     log.write(f"$ {' '.join(cmd)}\n")
     log.flush()
     start = time.monotonic()
     try:
-        rc = subprocess.run([exe, *cmd[1:]], cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT,
-                            timeout=INSTALL_TIMEOUT).returncode
-        detail = f"exit {rc}"
-    except (OSError, subprocess.SubprocessError) as e:
+        # Own process group, so a timeout also stops the scripts the manager started.
+        proc = subprocess.Popen([exe, *cmd[1:]], cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except OSError as e:
         log.write(f"cloud-prep: {e}\n")
         rc, detail = None, str(e)
+    else:
+        try:
+            rc = proc.wait(timeout=INSTALL_TIMEOUT)
+            detail = f"exit {rc}"
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            rc, detail = None, f"timed out after {INSTALL_TIMEOUT}s"
+            log.write(f"cloud-prep: {detail}; stopped the install and its child processes\n")
     secs = int(time.monotonic() - start)
     if rc != 0:
         return f"failed {' '.join(cmd)} ({detail}, {secs}s) — log: {sd / 'log'}"
@@ -476,31 +560,130 @@ def _run_plan(repo: Path, plan: Plan, node_major: int | None, env: dict[str, str
     return f"ok {manager} ({secs}s)"
 
 
+NO_PIN = object()  # a request or result written without the pin (older kits)
+
+
+def _write_json(sd: Path, name: str, data: dict) -> None:
+    """Atomic; each writer has its own temp file."""
+    fd, tmp = tempfile.mkstemp(dir=sd, prefix=f".{name}-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(data))
+        os.replace(tmp, sd / name)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(_read(path) or "")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_request(repo: Path, sd: Path, node_major: int | None, node_bin: Path | None, pin=NO_PIN) -> None:
+    """The inputs the latest prep asked for; a running install re-reads them when it finishes.
+    `pin` is the Node pin that chose node_major, read before the runtime was resolved, so a pin
+    edited meanwhile is never stored next to a Node it did not choose."""
+    _write_json(sd, "request.json", {"node": node_major, "node_bin": str(node_bin) if node_bin else None,
+                                     "pin": node_spec(repo)[0] if pin is NO_PIN else pin})
+
+
+def _write_built(sd: Path, pin, node_major: int | None = None) -> None:
+    """The pin the installed result was built for, and the Node major it was built with."""
+    if pin is NO_PIN:
+        with contextlib.suppress(OSError):
+            (sd / "built.json").unlink()
+    else:
+        _write_json(sd, "built.json", {"pin": pin, "node": node_major})
+
+
+def _fallback_node(sd: Path) -> str | None:
+    """Why the installed result does not serve its pin: it was built with a fallback Node."""
+    built = _read_json(sd / "built.json")
+    pin, major = built.get("pin"), built.get("node")
+    if isinstance(pin, str) and isinstance(major, int) and not pin_allows(pin, major):
+        return f"built with Node {major}, which does not satisfy the pin ({pin})"
+    return None
+
+
+def _pin_changed(repo: Path, sd: Path) -> bool:
+    """The repo's Node pin differs from the one the installed result was built for (else from
+    the one the latest prep saw)."""
+    for name in ("built.json", "request.json"):
+        data = _read_json(sd / name)
+        if "pin" in data:
+            return data["pin"] != node_spec(repo)[0]
+    return False
+
+
+def _read_request(sd: Path, default: tuple[int | None, Path | None]) -> tuple[int | None, Path | None, object]:
+    """(Node major, Node bin dir, pin) from one read of request.json, so the three agree."""
+    data = _read_json(sd / "request.json")
+    try:
+        major, node_bin = data["node"], data["node_bin"]
+    except KeyError:
+        return (*default, NO_PIN)
+    return ((major if isinstance(major, int) else None), (Path(node_bin) if node_bin else None),
+            data.get("pin", NO_PIN))
+
+
+def _inputs_key(repo: Path, node_major: int | None, node_bin: Path | None, pin=NO_PIN) -> tuple:
+    stamps = tuple(_plan_stamp(repo, p, node_major) for p in install_plans(repo))
+    return node_major, str(node_bin), pin, stamps
+
+
+def _install_round(repo: Path, node_major: int | None, node_bin: Path | None, sd: Path) -> tuple[int, str]:
+    """Corepack, then every install plan; the caller holds the repo's lock and writes the
+    returned status. Returns (exit code, final status line), failures first."""
+    plans = install_plans(repo)
+    if all(plan_current(repo, p, node_major, sd) for p in plans):
+        return 0, "; ".join(f"ok {p[0]} (unchanged)" for p in plans) or "none"
+    parts = []
+    with open(sd / "log", "w") as log:  # opened only once there is something to install
+        try:
+            env = _install_env(node_bin)
+            if node_bin and _needs_corepack(repo, plans):
+                try:
+                    problems = ensure_corepack(node_bin.parent, time.monotonic() + 600)
+                except Exception as e:  # noqa: BLE001 — the install below reports a missing shim
+                    problems = [str(e)]
+                for problem in problems:
+                    log.write(f"cloud-prep: corepack: {problem}\n")
+            parts = [_run_plan(repo, plan, node_major, env, sd, log) for plan in plans] or ["none"]
+        except Exception as e:  # noqa: BLE001 — the status must never stay "running"
+            log.write(f"cloud-prep error: {e}\n")
+            parts.append(f"failed (cloud-prep error: {e}) — log: {sd / 'log'}")
+    parts.sort(key=lambda p: not p.startswith("failed"))
+    return (1 if parts[0].startswith("failed") else 0), "; ".join(parts)
+
+
 def run_install(repo: Path, node_major: int | None, node_bin: Path | None) -> int:
-    """Background child: corepack, then every install plan, under the repo's lock.
-    Always leaves a final status, failures first."""
+    """Background child: installs under the repo's lock, then installs again while the inputs
+    (lockfiles, Node major) changed underneath it. A launcher that finds this child running
+    writes its request before it checks the lock, and the child re-reads the request after
+    releasing the lock, so no request is missed."""
     sd = state_dir(repo)
-    with open(sd / "lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # a second launcher waits here, then finds the stamps current
-        parts = []
-        with open(sd / "log", "w") as log:
-            try:
-                plans = install_plans(repo)
-                env = _install_env(node_bin)
-                if node_bin and any(p[0] in ("pnpm", "yarn") for p in plans):
-                    try:
-                        problems = ensure_corepack(node_bin.parent, time.monotonic() + 600)
-                    except Exception as e:  # noqa: BLE001 — the install below reports a missing shim
-                        problems = [str(e)]
-                    for problem in problems:
-                        log.write(f"cloud-prep: corepack: {problem}\n")
-                parts = [_run_plan(repo, plan, node_major, env, sd, log) for plan in plans] or ["none"]
-            except Exception as e:  # noqa: BLE001 — the status must never stay "running"
-                log.write(f"cloud-prep error: {e}\n")
-                parts.append(f"failed (cloud-prep error: {e}) — log: {sd / 'log'}")
-        parts.sort(key=lambda p: not p.startswith("failed"))
-        (sd / "status").write_text("; ".join(parts) + "\n")
-    return 1 if parts[0].startswith("failed") else 0
+    default = (node_major, node_bin)
+    rc = 0
+    for attempt in range(5):  # inputs that keep changing still end in a final status
+        with open(sd / "lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            major, bin_dir, pin = request = _read_request(sd, default)
+            done = _inputs_key(repo, *request)
+            if attempt:  # the inputs changed under the last round; record the pin they hold now
+                pin = node_spec(repo)[0]
+            rc, status = _install_round(repo, major, bin_dir, sd)
+            if attempt < 4 and _inputs_key(repo, *_read_request(sd, default)) != done:
+                status = "running (the inputs changed; installing again)"  # never a final status between rounds
+            _write_built(sd, pin, major)  # before the status, so a final status never meets an older pin
+            (sd / "status").write_text(status + "\n")
+        if _inputs_key(repo, *_read_request(sd, default)) == done:
+            break
+    return rc
 
 
 def _install_running(sd: Path) -> bool:
@@ -514,14 +697,24 @@ def _install_running(sd: Path) -> bool:
     return False
 
 
-def start_background_install(repo: Path, node_major: int | None, node_bin: Path | None) -> str:
+def start_background_install(repo: Path, node_major: int | None, node_bin: Path | None, pin=NO_PIN) -> str:
     plans = install_plans(repo)
     if not plans:
         return "no lockfile at the repo root; nothing to install"
     sd = state_dir(repo)
     cmds = ", ".join(" ".join(p[1]) for p in plans)
+    _write_request(repo, sd, node_major, node_bin, pin)  # before the running check; see run_install
+    if all(plan_current(repo, p, node_major, sd) for p in plans):
+        if not _install_running(sd):  # a running install records its own pin when it finishes
+            major, _, pin = _read_request(sd, (None, None))
+            _write_built(sd, pin, major)  # this Node's result already serves this pin
+            if not (_read(sd / "status") or "").startswith("ok"):
+                # a failed or interrupted install for other inputs left its status behind
+                (sd / "status").write_text("; ".join(f"ok {p[0]} (unchanged)" for p in plans) + "\n")
+        return f"up to date ({', '.join(p[0] for p in plans)}: lockfiles and Node unchanged)"
     if _install_running(sd):
-        return f"an install is already running ({cmds}); `cloud-prep --wait` reports it"
+        return (f"an install is already running ({cmds}); it installs again if these inputs changed. "
+                "`cloud-prep --wait` reports it")
     (sd / "status").write_text(f"running {cmds}\n")
     argv = [sys.executable, str(Path(__file__).resolve()), "--install", str(repo)]
     if node_major:
@@ -533,13 +726,32 @@ def start_background_install(repo: Path, node_major: int | None, node_bin: Path 
     return f"installing in the background ({cmds})"
 
 
+def _settled(repo: Path, sd: Path, status: str) -> str:
+    """A finished status, checked against the inputs the latest prep asked for."""
+    plans = install_plans(repo)
+    if status.startswith("failed") or not plans:
+        return status
+    node_major = _read_request(sd, (None, None))[0]
+    uses_node = _js_plan(repo) is not None  # a Python-only repo does not depend on the Node pin
+    if (uses_node and _pin_changed(repo, sd)) or not all(plan_current(repo, p, node_major, sd) for p in plans):
+        return (f"stale: the lockfiles or Node changed after this install ({status}); "
+                "run `cloud-prep` to install again")
+    fallback = uses_node and _fallback_node(sd)
+    if fallback:
+        return f"stale: {fallback} ({status}); run `cloud-prep` again once that Node can be installed"
+    return status if status != "none" else "ok (" + ", ".join(f"{p[0]} unchanged" for p in plans) + ")"
+
+
 def wait_status(repo: Path, timeout: float) -> str:
     sd = state_dir(repo)
     deadline = time.monotonic() + timeout
     while True:
         status = _read(sd / "status") or "none\n"
         if not status.startswith("running"):
-            return status.strip()
+            settled = _settled(repo, sd, status.strip())
+            if not (settled.startswith("stale") and _install_running(sd)):
+                return settled
+            status = "running (an install for the newer inputs is under way)\n"
         try:
             stale = time.time() - (sd / "status").stat().st_mtime > 15
         except OSError:
@@ -568,7 +780,9 @@ def land_policy(name: str | None) -> str:
         return "no GitHub origin; `land` does not apply"
     may_merge, why = policy_for(name, KIT_DIR)
     if may_merge:
-        return f"{name}: `land` merges after green CI"
+        # by name only: the repository id is not known here
+        return (f"{name}: owner allowlisted; `land` decides at merge time (it also checks the client list "
+                f"by repository id) and merges after green CI")
     return f"{name}: `land` opens the PR and stops for review ({why})"
 
 
@@ -587,10 +801,14 @@ def repos_in(cwd: Path) -> list[Path]:
 
 
 def resolve_node(major: int, deadline: float) -> tuple[int | None, Path | None, str | None]:
-    """(major, bin dir, problem) of the Node to use: the pinned one, else the one on PATH."""
+    """(major, bin dir, problem) of the Node to use: the pinned one, else the newest one in
+    /opt, else the one on PATH."""
     try:
         return major, install_node(major, deadline) / "bin", None
     except Exception as e:  # noqa: BLE001 — a missing Node must not stop the session
+        for other in sorted(installed_majors(), reverse=True):
+            if other != major and node_ready(OPT / f"node{other}", other):
+                return other, OPT / f"node{other}" / "bin", f"Node {major} not available ({e})"
         node = shutil.which("node")
         actual = _node_major(node) if node else None
         return actual, (Path(node).parent if actual else None), f"Node {major} not available ({e})"
@@ -618,11 +836,21 @@ def prep(repo: Path, write_session_env: bool, primary: bool, deadline: float) ->
         lines.append(f"{problem}; {using}")
     else:
         pin = f" (from {source}: {spec})" if source else " (no pin; default)"
+        if not pin_allows(spec, major):
+            pin = f" — does not satisfy the pin (from {source}: {spec}); no Node major this kit knows fits it"
         where = "" if primary else f"; for this repo use {node_bin} (not on the session PATH)"
         lines.append(f"Node {_node_version(node_bin / 'node') or major}{pin}{where}")
     if write_session_env and primary:
-        write_env(None if problem else node_bin)
-    lines.append("Dependencies: " + start_background_install(repo, major, node_bin))
+        write_env(node_bin)
+    plans = install_plans(repo)
+    if node_bin and node_bin.parent.parent == OPT and _needs_corepack(repo, plans):
+        # pnpm/yarn shims before Claude's first command, not when the background install gets to them
+        try:
+            problems = ensure_corepack(node_bin.parent, deadline)
+        except Exception as e:  # noqa: BLE001 — reported, never fatal
+            problems = [str(e)]
+        lines += [f"pnpm/yarn not ready: {p}" for p in problems]
+    lines.append("Dependencies: " + start_background_install(repo, major, node_bin, spec))
     lines.append("Landing: " + land_policy(repo_name(repo)))
     return lines
 
@@ -665,7 +893,7 @@ def main(argv: list[str]) -> int:
         for repo in repos:
             status = wait_status(repo, args.timeout)
             print(f"{repo.name}: {status}")
-            if status.startswith(("failed", "running")):
+            if status.startswith(("failed", "running", "stale")):
                 worst = 1
         return worst
 

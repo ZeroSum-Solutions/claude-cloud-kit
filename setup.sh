@@ -23,19 +23,52 @@ BIN="${CLOUD_KIT_BIN:-/usr/local/bin}"
 REQUIRED="setup.sh bin/land bin/cloud-prep hooks/guard.py lib/kitpolicy.py claude/CLAUDE.md claude/settings.json policy/client-repos.txt"
 log() { echo "[cloud-kit] $*" >&2; }
 
-lock() {  # one installer at a time; a lock older than 5 minutes is stale
-  local i
-  for i in $(seq 1 "${CLOUD_KIT_LOCK_WAIT:-30}"); do
-    mkdir "$KIT.lock" 2>/dev/null && return 0
-    if [ -n "$(find "$KIT.lock" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
-      rmdir "$KIT.lock" 2>/dev/null
-      continue
-    fi
-    sleep 1
-  done
+LOCKED=0
+STAGE=""
+
+# One installer at a time: an flock on fd 9, which this shell keeps open. The kernel drops it
+# when the holder exits, so a dead installer never leaves a stale lock and nothing has to
+# guess. Python takes the lock (macOS has no flock binary); it belongs to the open file, so
+# it stays with this shell after Python exits.
+lock() {
+  mkdir -p "$(dirname "$KIT")" && exec 9>>"$KIT.flock" || return 1
+  if python3 - "${CLOUD_KIT_LOCK_WAIT:-30}" <<'PY'
+import fcntl, sys, time
+deadline = time.monotonic() + float(sys.argv[1])
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.2)
+PY
+  then
+    LOCKED=1
+    return 0
+  fi
+  exec 9>&-
   return 1
 }
-unlock() { rmdir "$KIT.lock" 2>/dev/null; }
+unlock() {
+  [ "$LOCKED" = 1 ] || return 0
+  LOCKED=0
+  exec 9>&-
+}
+
+restore_kit() {  # an installer killed between the two moves leaves only $KIT.old
+  if [ ! -d "$KIT" ] && [ -d "$KIT.old" ]; then
+    mv "$KIT.old" "$KIT" && log "restored the kit after an interrupted install"
+  fi
+}
+
+cleanup() {  # EXIT trap: never leave the kit missing, a staging dir behind, or the lock held
+  [ "$LOCKED" = 1 ] || return 0
+  restore_kit
+  [ -n "$STAGE" ] && rm -rf "$STAGE"
+  unlock
+}
 
 fetch_kit() {  # $1 = empty target dir; fetches every file in MANIFEST and verifies it
   local dir="$1"
@@ -87,40 +120,85 @@ if not isinstance(settings, dict) or not isinstance(settings.get("hooks"), dict)
 PY
   bash -n "$dir/setup.sh" || return 1
   python3 -I "$dir/bin/land" --help >/dev/null || return 1
-  echo '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/"}' \
-    | CLAUDE_CODE_REMOTE=true python3 -I "$dir/hooks/guard.py" >/dev/null || return 1
+  python3 -I "$dir/bin/cloud-prep" --help >/dev/null || return 1
+  python3 -I - "$dir" <<'PY' || return 1
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(root / "lib"))
+from kitpolicy import PolicyError, load_clients
+try:
+    load_clients(root / "policy" / "client-repos.txt")
+except PolicyError as e:
+    sys.exit(f"policy: {e}")
+PY
+  # The guard must allow a plain command and deny a push to main.
+  python3 -I - "$dir/hooks/guard.py" <<'PY' || return 1
+import json, os, subprocess, sys
+env = dict(os.environ, CLAUDE_CODE_REMOTE="true")
+
+def denied(command):
+    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"})
+    proc = subprocess.run([sys.executable, "-I", sys.argv[1]], input=event, capture_output=True,
+                          text=True, env=env, timeout=20)
+    if proc.returncode != 0:
+        sys.exit(f"guard exited {proc.returncode} on {command!r}")
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except ValueError:
+        sys.exit(f"guard printed something that is not JSON on {command!r}")
+    return (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+
+if denied("ls"):
+    sys.exit("guard denies ls")
+if not denied("git push origin main"):
+    sys.exit("guard allows git push origin main")
+PY
 }
 
-install_kit() {
-  local tmp
-  tmp="$(mktemp -d "$(dirname "$KIT")/.claude-cloud-kit.XXXXXX")" || return 1
-  if ! fetch_kit "$tmp"; then
-    log "fetch failed; keeping the current kit"; rm -rf "$tmp"; return 1
+install_kit() {  # the caller holds the lock
+  # Staging dirs left by an installer that was killed outright; only a lock holder makes them.
+  rm -rf "$(dirname "$KIT")"/.claude-cloud-kit.??????
+  STAGE="$(mktemp -d "$(dirname "$KIT")/.claude-cloud-kit.XXXXXX")" || { STAGE=""; return 1; }
+  if ! fetch_kit "$STAGE"; then
+    log "fetch failed; keeping the current kit"; rm -rf "$STAGE"; STAGE=""; return 1
   fi
-  if ! verify_kit "$tmp"; then
-    log "new kit failed verification; keeping the current kit"; rm -rf "$tmp"; return 1
+  if ! verify_kit "$STAGE"; then
+    log "new kit failed verification; keeping the current kit"; rm -rf "$STAGE"; STAGE=""; return 1
   fi
-  chmod 755 "$tmp"/bin/* "$tmp"/hooks/*.py 2>/dev/null
-  chmod -R a+rX "$tmp"
+  chmod 755 "$STAGE"/bin/* "$STAGE"/hooks/*.py 2>/dev/null
+  chmod -R a+rX "$STAGE"
+  restore_kit
   rm -rf "$KIT.old"
   if [ -d "$KIT" ] && ! mv "$KIT" "$KIT.old"; then
-    log "cannot move the current kit aside"; rm -rf "$tmp"; return 1
+    log "cannot move the current kit aside"; rm -rf "$STAGE"; STAGE=""; return 1
   fi
-  if ! mv "$tmp" "$KIT"; then
+  # mv into an existing directory would nest the kit inside it (macOS mv has no -T).
+  if [ -e "$KIT" ] || ! mv "$STAGE" "$KIT"; then
     log "cannot install the new kit; restoring the current one"
-    [ -d "$KIT.old" ] && mv "$KIT.old" "$KIT"
-    rm -rf "$tmp"; return 1
+    restore_kit
+    rm -rf "$STAGE"; STAGE=""; return 1
   fi
-  rm -rf "$KIT.old"
-  ln -sf "$KIT/bin/land" "$BIN/land" && ln -sf "$KIT/bin/cloud-prep" "$BIN/cloud-prep"
+  STAGE=""
+  rm -rf "$KIT.old"  # only now that the new kit is in place
+}
+
+link_bins() {
+  mkdir -p "$BIN" && ln -sf "$KIT/bin/land" "$BIN/land" && ln -sf "$KIT/bin/cloud-prep" "$BIN/cloud-prep"
 }
 
 install_claude_config() {
+  local rc=0
   mkdir -p "$HOME/.claude" || return 1
-  cp "$KIT/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md.tmp" && mv "$HOME/.claude/CLAUDE.md.tmp" "$HOME/.claude/CLAUDE.md"
+  if ! { cp "$KIT/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md.tmp" \
+         && mv "$HOME/.claude/CLAUDE.md.tmp" "$HOME/.claude/CLAUDE.md"; }; then
+    rm -f "$HOME/.claude/CLAUDE.md.tmp"
+    log "could not write ~/.claude/CLAUDE.md"
+    rc=1
+  fi
   # Merge the kit's settings into any settings file already there: kit keys win, and the
-  # kit's own hook groups replace older kit groups instead of piling up.
-  python3 - "$KIT/claude/settings.json" "$HOME/.claude/settings.json" "$KIT" <<'PY'
+  # kit's own hooks replace older kit hooks instead of piling up. Other hooks stay, even in
+  # a group that also held a kit hook.
+  python3 - "$KIT/claude/settings.json" "$HOME/.claude/settings.json" "$KIT" <<'PY' || rc=1
 import json, os, pathlib, sys
 kit = json.loads(pathlib.Path(sys.argv[1]).read_text())
 dest = pathlib.Path(sys.argv[2])
@@ -132,17 +210,24 @@ except (OSError, ValueError):
 if not isinstance(cur, dict):
     cur = {}
 
-def is_kit_group(group):
+def is_kit_hook(hook):
+    return isinstance(hook, dict) and any(m in str(hook.get("command", "")) for m in markers)
+
+def without_kit_hooks(group):
+    """The group minus its kit hooks; None when nothing else was in it."""
     hooks = group.get("hooks") if isinstance(group, dict) else None
-    return isinstance(hooks, list) and any(
-        m in str(h.get("command", "")) for h in hooks if isinstance(h, dict) for m in markers)
+    if not isinstance(hooks, list) or not any(is_kit_hook(h) for h in hooks):
+        return group
+    kept = [h for h in hooks if not is_kit_hook(h)]
+    return {**group, "hooks": kept} if kept else None
 
 for key, value in kit.items():
     if key == "hooks":
         hooks = cur.get("hooks") if isinstance(cur.get("hooks"), dict) else {}
         for event, groups in value.items():
             existing = hooks.get(event) if isinstance(hooks.get(event), list) else []
-            hooks[event] = [g for g in existing if not is_kit_group(g)] + groups
+            kept = [g for g in map(without_kit_hooks, existing) if g is not None]
+            hooks[event] = kept + groups
         cur["hooks"] = hooks
     elif isinstance(value, dict) and isinstance(cur.get(key), dict):
         cur[key].update(value)
@@ -152,23 +237,32 @@ tmp = dest.with_name(dest.name + ".tmp")
 tmp.write_text(json.dumps(cur, indent=2) + "\n")
 os.replace(tmp, dest)
 PY
+  return $rc
 }
 
 if ! lock; then
   log "another kit install is running; skipping"
   exit 0
 fi
-trap unlock EXIT
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+restore_kit
 
 if [ "${1:-}" = "--refresh" ]; then
-  install_kit && { install_claude_config || log "could not refresh ~/.claude config"; }
+  if install_kit; then
+    link_bins || log "could not link land and cloud-prep into $BIN"
+    install_claude_config || log "could not refresh ~/.claude config"
+  fi
   exit 0
 fi
 
 if ! install_kit && [ ! -d "$KIT" ]; then
   log "kit not installed"; exit 0
 fi
+link_bins || log "could not link land and cloud-prep into $BIN"
 install_claude_config || log "could not write ~/.claude config"
+unlock  # the Node installs below take their own locks and can run for minutes
 # Node 24 is the default for Devin's repos; 26 covers the newest pins. Both in parallel.
 if [ "${CLOUD_KIT_SKIP_NODE:-}" != "1" ]; then
   python3 "$KIT/bin/cloud-prep" --install-node 24 >/dev/null 2>&1 &
